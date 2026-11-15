@@ -24,7 +24,7 @@ function setView(view){
  for(const [nav,selected] of [[$('profileNav'),view==='profile'],[$('servicesNav'),view==='services'],[$('automationNav'),view==='automation'],[$('overviewNav'),overviewSelected],[$('accountSettingsNav'),view==='account'||view.startsWith('connection-panel-')]]){nav.classList.toggle('active',selected);if(selected)nav.setAttribute('aria-current','page');else nav.removeAttribute('aria-current')}
  sidebarPanels.forEach(item=>{const selected=item.panel===destination;item.nav.classList.toggle('active',selected);item.nav.setAttribute('aria-expanded',String(selected));if(selected)item.nav.setAttribute('aria-current','page');else item.nav.removeAttribute('aria-current')});
  const title=view==='profile'?'账号':view==='services'?'服务':view==='automation'?'自动化':view==='overview'?'实例总览':view==='account'?'连接设置':view==='logs'?'实例日志':sidebarPanels.find(item=>item.panel===destination).nav.textContent;
- document.querySelector('.page-header h1').textContent=title;document.querySelector('.breadcrumb span:last-child').textContent=title;
+ document.querySelector('.page-header h1').textContent=title;
  $('refresh').hidden=view!=='overview';$('serviceRefresh').hidden=view!=='services';
  document.querySelector('main').scrollTop=0;
  queueMicrotask(()=>{if(typeof scheduleResourceRefresh==='function')scheduleResourceRefresh()});
