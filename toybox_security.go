@@ -97,7 +97,7 @@ func makeWebAccessConfig(id, password string, apiTokens ...string) (webAccessCon
 }
 
 func apiBaseURL(r ServiceRecord) string {
-	u, e := urlForToybox(r.URL)
+	u, e := urlForToyboxWithCustom(r.URL, r.TunnelURL)
 	if e != nil {
 		return ""
 	}

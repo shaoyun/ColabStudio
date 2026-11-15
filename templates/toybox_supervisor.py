@@ -15,6 +15,7 @@ COMFY = ROOT / 'ComfyUI'
 APP = ROOT / 'minimax-h3-colab' / 'toybox'
 DEPLOYING = True
 PROGRESS=ProgressReporter(ROOT)
+TUNNEL_LOG_POS = 0
 
 def update(**kw):
     with MUTEX:
@@ -134,11 +135,105 @@ def wait_http(url):
             time.sleep(2)
     raise RuntimeError('Service readiness timed out')
 
+def load_tunnel_config():
+    cfg_path = ROOT / 'tunnel.json'
+    if cfg_path.exists():
+        try:
+            cfg_path.chmod(0o600)
+        except OSError:
+            pass
+        try:
+            data = json.loads(cfg_path.read_text(encoding='utf-8'))
+            if isinstance(data, dict) and data.get('mode') == 'named':
+                url = str(data.get('url') or '').strip()
+                token = str(data.get('token') or '').strip()
+                if url and token:
+                    return {'mode': 'named', 'url': url, 'token': token}
+        except Exception:
+            pass
+    return {'mode': 'quick'}
+
+def tunnel_signature(tcfg):
+    if tcfg.get('mode') == 'named':
+        raw = (tcfg.get('url', '') + '\n' + tcfg.get('token', '')).encode('utf-8')
+        return 'named:' + hashlib.sha256(raw).hexdigest()
+    return 'quick'
+
+def tunnel_metrics_ready():
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:20241/ready', timeout=2) as r:
+            return getattr(r, 'status', 200) == 200
+    except Exception:
+        return False
+
+def start_tunnel(force_restart=False):
+    global TUNNEL_LOG_POS
+    tcfg = load_tunnel_config()
+    sig = tunnel_signature(tcfg)
+    sig_file = ROOT / 'tunnel.sig'
+    prev_sig = sig_file.read_text(encoding='utf-8').strip() if sig_file.exists() else None
+    proc = PROCS.get('tunnel')
+    running = bool(proc and proc.poll() is None)
+    need_restart = bool(force_restart or (prev_sig is not None and prev_sig != sig) or (prev_sig is None and running and tcfg['mode'] == 'named'))
+    tunnel_log = ROOT / 'tunnel.log'
+    if need_restart:
+        stop_proc('tunnel')
+        tunnel_log.write_bytes(b'')
+        TUNNEL_LOG_POS = 0
+        update(url='', tunnel_mode=tcfg['mode'])
+        running = False
+    sig_file.write_text(sig, encoding='utf-8')
+    update(tunnel_mode=tcfg['mode'])
+    if not running:
+        TUNNEL_LOG_POS = tunnel_log.stat().st_size if tunnel_log.exists() else 0
+    if tcfg['mode'] == 'named':
+        spawn('tunnel', [str(ROOT / 'cloudflared'), 'tunnel', '--no-autoupdate', '--metrics', '127.0.0.1:20241', 'run'], env=dict(os.environ, TUNNEL_TOKEN=tcfg['token']))
+    else:
+        spawn('tunnel', [str(ROOT / 'cloudflared'), 'tunnel', '--url', 'http://127.0.0.1:8190'])
+
+def check_tunnel_url():
+    tcfg = load_tunnel_config()
+    update(tunnel_mode=tcfg['mode'])
+    tunnel_log = ROOT / 'tunnel.log'
+    tail = ''
+    if tunnel_log.exists():
+        size = tunnel_log.stat().st_size
+        start = max(TUNNEL_LOG_POS, size - 16384)
+        if start < size:
+            with tunnel_log.open('rb') as f:
+                f.seek(start)
+                tail = f.read().decode('utf-8', 'replace')
+    if tcfg['mode'] == 'named':
+        sig_file = ROOT / 'tunnel.sig'
+        sig_ok = sig_file.exists() and sig_file.read_text(encoding='utf-8').strip() == tunnel_signature(tcfg)
+        proc = PROCS.get('tunnel')
+        alive = bool(proc and proc.poll() is None)
+        if sig_ok and alive and (tunnel_metrics_ready() or 'Registered tunnel connection' in tail):
+            update(url=tcfg['url'])
+        else:
+            update(url='')
+        return
+    if tail:
+        urls = re.findall(r'https://[a-z0-9-]+\.trycloudflare\.com', tail)
+        if urls:
+            update(url=urls[-1])
+
 def digest(path, kind='sha256'):
     h = hashlib.new(kind)
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
             h.update(chunk)
+    return h.hexdigest()
+
+def compute_web_sig():
+    """Hash toybox version and wrapper scripts so same-version tunnel switches keep toybox running."""
+    h = hashlib.sha256()
+    h.update(str(LOCK.get('toybox', '')).encode('utf-8'))
+    for name in ('web_runner.py', 'toybox_auth.py', 'toybox_openai.py'):
+        p = ROOT / name
+        h.update(b'\0' + name.encode('utf-8') + b'\0')
+        if p.is_file():
+            h.update(p.read_bytes())
     return h.hexdigest()
 
 def restore():
@@ -185,6 +280,7 @@ def deploy():
             except Exception:
                 installed_version = ''
         comfy_changed = False
+        toybox_changed = False
         tunnel_changed = False
         if not already_installed:
             run([sys.executable, '-c', check])
@@ -233,6 +329,7 @@ def deploy():
                     PROGRESS.set(phase='repositories')
                     update(stage='installing', message='Updating Toybox to pinned version')
                     clone(repo, dest)
+                    toybox_changed = True
             cf = ROOT / 'cloudflared'
             if not cf.exists() or not LOCK['cloudflared'].get('sha256') or digest(cf) != LOCK['cloudflared']['sha256']:
                 PROGRESS.set(phase='tunnel_setup')
@@ -242,6 +339,7 @@ def deploy():
                 cf.chmod(0o700)
                 tunnel_changed = True
             if installed_version != LOCK['toybox']:
+                toybox_changed = True
                 atomic(installed_file, {'version': LOCK['toybox']})
         PROGRESS.set(phase='restoring')
         restore()
@@ -260,13 +358,15 @@ def deploy():
         spawn('comfyui', [sys.executable, 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--output-directory', str(DATA / 'output')], cwd=COMFY)
         wait_http('http://127.0.0.1:8188/system_stats')
         PROGRESS.set(phase='starting_web')
-        if already_installed:
+        web_sig_file = ROOT / 'web.sig'
+        prev_web_sig = web_sig_file.read_text(encoding='utf-8').strip() if web_sig_file.exists() else None
+        web_sig = compute_web_sig()
+        if already_installed and (toybox_changed or (prev_web_sig is not None and prev_web_sig != web_sig)):
             stop_proc('toybox')
+        web_sig_file.write_text(web_sig, encoding='utf-8')
         spawn('toybox', [sys.executable, str(ROOT / 'web_runner.py')], cwd=APP, env=dict(os.environ, H3TOYBOX_PORT='8190', H3TOYBOX_DATA=str(DATA), H3TOYBOX_SECRETS=str(ROOT / 'secrets.json')))
         wait_http('http://127.0.0.1:8190/api/config')
-        if tunnel_changed:
-            stop_proc('tunnel')
-        spawn('tunnel', [str(ROOT / 'cloudflared'), 'tunnel', '--url', 'http://127.0.0.1:8190'])
+        start_tunnel(force_restart=tunnel_changed)
         PROGRESS.set(phase='ready')
         update(stage='online', message='Services are ready')
     except Exception as exc:
@@ -277,15 +377,83 @@ def deploy():
     finally:
         DEPLOYING = False
 
+def proc_start_epoch(name):
+    """Return Unix epoch seconds when a running managed child started, or None when unavailable."""
+    proc = PROCS.get(name)
+    if not proc or proc.poll() is not None:
+        return None
+    try:
+        btime = None
+        for line in pathlib.Path('/proc/stat').read_text().splitlines():
+            if line.startswith('btime '):
+                btime = int(line.split()[1])
+                break
+        if btime is None:
+            return None
+        stat = pathlib.Path('/proc/%d/stat' % proc.pid).read_text().rsplit(')', 1)[1].split()
+        clk = os.sysconf('SC_CLK_TCK')
+        if clk <= 0:
+            return None
+        return btime + int(stat[19]) / float(clk)
+    except Exception:
+        return None
+
 def is_busy():
-    q = fetch('http://127.0.0.1:8188/queue')
     jobs = fetch('http://127.0.0.1:8190/api/jobs')
+    q = fetch('http://127.0.0.1:8188/queue')
     agents = fetch('http://127.0.0.1:8190/api/agent/runs')
-    if not isinstance(q.get('queue_running'), list) or not isinstance(q.get('queue_pending'), list) or not isinstance(jobs, list) or not isinstance(agents, list):
+    if not isinstance(q, dict) or not isinstance(q.get('queue_running'), list) or not isinstance(q.get('queue_pending'), list) or not isinstance(jobs, list) or not isinstance(agents, list):
         raise RuntimeError('Unknown queue schema')
-    busy_states = {'queued', 'running', 'joining', 'planning', 'rewriting', 'generating', 'revising'}
-    # Only known terminal Agent states may be treated as idle.
-    return bool(q['queue_running'] or q['queue_pending'] or any(j.get('status') not in {'done','error','cancelled','stopped'} for j in jobs) or any(a.get('status') not in {'done','error','stopped','cancelled'} for a in agents))
+    if q['queue_running'] or q['queue_pending']:
+        return True
+    comfy_ids = {item[1] for item in (q['queue_running'] + q['queue_pending']) if isinstance(item, list) and len(item) > 1 and isinstance(item[1], str)}
+    now = time.time()
+    toybox_started = proc_start_epoch('toybox')
+    job_done = {'done', 'error', 'cancelled', 'stopped'}
+    agent_done = {'done', 'error', 'stopped', 'cancelled'}
+    agent_active = {'queued', 'planning', 'rewriting', 'generating', 'revising'}
+    for j in jobs:
+        if not isinstance(j, dict):
+            return True
+        st = j.get('status')
+        if st in job_done:
+            continue
+        if st in {'queued', 'running'}:
+            if j.get('id') in comfy_ids:
+                return True
+            created = j.get('created')
+            if not isinstance(created, (int, float)) or isinstance(created, bool) or now - created < 120:
+                return True
+            continue
+        if st == 'joining':
+            finished = j.get('finished')
+            if not isinstance(finished, (int, float)) or isinstance(finished, bool):
+                return True
+            if toybox_started is not None and finished < toybox_started - 5:
+                continue
+            if now - finished < 900:
+                return True
+            continue
+        return True
+    for a in agents:
+        if not isinstance(a, dict):
+            return True
+        st = a.get('status')
+        if st in agent_done:
+            continue
+        # Active agent threads live only in toybox memory; records older than process start are orphans.
+        if st in agent_active and toybox_started is not None:
+            ts_values = []
+            created = a.get('created')
+            if isinstance(created, (int, float)) and not isinstance(created, bool):
+                ts_values.append(float(created))
+            for entry in a.get('log') or []:
+                if isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], (int, float)) and not isinstance(entry[0], bool):
+                    ts_values.append(float(entry[0]))
+            if ts_values and max(ts_values) < toybox_started - 5:
+                continue
+        return True
+    return False
 
 def clean_config(v):
     if isinstance(v, dict):
@@ -368,6 +536,10 @@ if __name__ == '__main__':
                         stop_requested = True
                     else:
                         sys.exit(0)
+                elif cmd.get('action') == 'reload_tunnel':
+                    if not DEPLOYING and not DRAIN.exists():
+                        start_tunnel(force_restart=True)
+                        check_tunnel_url()
             if not DEPLOYING:
                 if stop_requested:
                     sys.exit(0)
@@ -396,14 +568,8 @@ if __name__ == '__main__':
                         if PROCS.get('toybox') and PROCS['toybox'].poll() is not None:
                             spawn('toybox', [sys.executable, str(ROOT / 'web_runner.py')], cwd=APP, env=dict(os.environ,H3TOYBOX_PORT='8190',H3TOYBOX_DATA=str(DATA),H3TOYBOX_SECRETS=str(ROOT/'secrets.json')))
                         if PROCS.get('tunnel') and PROCS['tunnel'].poll() is not None:
-                            spawn('tunnel',[str(ROOT/'cloudflared'),'tunnel','--url','http://127.0.0.1:8190'])
-            tunnel_log = ROOT / 'tunnel.log'
-            if tunnel_log.exists():
-                with tunnel_log.open('rb') as f:
-                    f.seek(max(0, tunnel_log.stat().st_size-16384))
-                    urls = re.findall(r'https://[a-z0-9-]+\.trycloudflare\.com', f.read().decode('utf-8','replace'))
-                if urls:
-                    update(url=urls[-1])
+                            start_tunnel(force_restart=False)
+            check_tunnel_url()
         except Exception as exc:
             print('Supervisor operation failed:', type(exc).__name__, flush=True)
             update(message='Supervisor operation failed; shutdown blocked', busy=True)

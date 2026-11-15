@@ -78,8 +78,14 @@ aside{position:relative;padding-top:calc(var(--mygo-titlebar-controls-bottom, 28
 .service-readiness [data-state=ready]{color:var(--accent)}
 .service-readiness [data-state=error]{color:var(--danger)}
 .service-address{border-top:1px solid var(--line);padding:16px 0}
-.service-address>label{display:block;margin:0 0 9px;font-size:11px;color:var(--muted)}
+.service-address-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 9px}
+.service-address-head>label{margin:0;font-size:11px;color:var(--muted)}
+.service-address-head .note{margin:0}
+.tunnel-link-btn{margin-left:auto;min-height:24px;padding:3px 9px;font-size:10px;color:var(--accent)}
 .service-address-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#tunnelConfigPanel code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;padding:1px 4px;border-radius:4px;background:var(--panel,rgba(127,127,127,.12))}
+#tunnelConfigPanel input[type=url]{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px}
+#tunnelModeBadge[data-active=true]{color:var(--accent);font-weight:550}
 .service-address-row input{flex:1;min-width:180px;font:11px ui-monospace,SFMono-Regular,monospace;user-select:text}
 .service-address-row button{font-size:11px;flex-shrink:0}
 .service-address>p.note{margin:9px 0 0;font-size:10px;overflow-wrap:anywhere}

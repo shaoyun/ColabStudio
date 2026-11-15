@@ -163,7 +163,7 @@ var logANSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 var logToyboxToken = regexp.MustCompile(`\bsk-toybox-[A-Za-z0-9_-]+\b`)
 var logAuthorization = regexp.MustCompile(`(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+`)
 var logQuerySecret = regexp.MustCompile(`(?i)([?&](?:api_key|token|key)=)[^&\s"'#]+`)
-var logAssignments = regexp.MustCompile(`(?i)((?:\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_ -]?key|x-api-key|x-goog-api-key|authorization|admin[_-]?password|password|token|colab-runtime-proxy-token)\b|密码|密钥|令牌)["']?\s*[:=：]\s*["']?)[^\s,"'&}]+`)
+var logAssignments = regexp.MustCompile(`(?i)((?:\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_ -]?key|x-api-key|x-goog-api-key|authorization|admin[_-]?password|password|tunnel[_-]?token|token|colab-runtime-proxy-token)\b|密码|密钥|令牌)["']?\s*[:=：]\s*["']?)[^\s,"'&}]+`)
 
 func redactLog(text string, secrets ...string) string {
 	text = logANSI.ReplaceAllString(text, "")
@@ -195,6 +195,7 @@ func (s *Studio) Logs(name string, lines int) (InstanceLog, error) {
 		if b, re := store.Get("refresh-token"); re == nil {
 			secrets = append(secrets, string(b))
 		}
+		secrets = append(secrets, tunnelRedactionSecrets()...)
 	}
 	s.mu.Unlock()
 	if e != nil {

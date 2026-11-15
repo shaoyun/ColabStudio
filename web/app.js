@@ -16,7 +16,7 @@ let currentView='overview';
 function setView(view){
  const destination=view==='profile'?$('profilePanel'):view==='services'?$('servicesPanel'):view==='automation'?$('automationPanel'):view==='overview'?$('overviewPanel'):view==='account'?$('accountPanel'):view==='logs'?$('logViewer'):sidebarPanels.find(item=>item.panel.id===view)?.panel;
  if(!destination)return;
- if(view!=='logs')closeLogs();if(view!=='services'){$('toyboxAccessPassword').value='';$('toyboxAccessPassword').type='password';$('showToyboxPassword').textContent='查看密码';$('toyboxAPIToken').value='';$('toyboxAPIToken').type='password';$('showToyboxAPIToken').textContent='查看 Token'}
+ if(view!=='logs')closeLogs();if(view!=='services'){$('toyboxAccessPassword').value='';$('toyboxAccessPassword').type='password';$('showToyboxPassword').textContent='查看密码';$('toyboxAPIToken').value='';$('toyboxAPIToken').type='password';$('showToyboxAPIToken').textContent='查看 Token';$('tunnelTokenInput').value='';$('tunnelTokenInput').type='password';$('toggleTunnelToken').textContent='显示'}
  currentView=view;
  document.querySelectorAll('[data-workspace-view]').forEach(panel=>{panel.hidden=panel!==destination});
  const overviewSelected=view==='overview'||view==='logs';
@@ -52,7 +52,7 @@ $('closeLogs').onclick=()=>{setView('overview');$('overviewNav').focus()};$('ref
 $('reuseLogin').onclick=()=>run(async()=>{note('正在读取本机已有登录并验证 Colab 访问权限…');closeLogs();await call('ReuseExistingLogin');clearResourceMonitoring();$('codeArea').hidden=true;await status();await refresh();note('已复用已有登录，无需浏览器授权；实例列表已更新。')});$('importConfig').onclick=()=>run(async()=>{closeLogs();await call('ImportEasyColabConfig');clearResourceMonitoring();await status();$('runtimes').replaceChildren(empty('配置已导入','点击浏览器授权连接账号。'));note('已导入客户端配置，未读取现有账号凭据。请点击浏览器授权。')});$('remoteLogin').onclick=()=>run(async()=>{closeLogs();await call('BeginRemoteLogin');$('codeArea').hidden=false;$('authCode').value='';note('请在浏览器选择账号并允许访问，将结果页上的授权码粘贴回应用。')});$('submitCode').onclick=()=>run(async()=>{const code=$('authCode').value;$('authCode').value='';closeLogs();await call('SubmitRemoteCode',code);clearResourceMonitoring();$('codeArea').hidden=true;await status();await refresh()});$('save').onclick=()=>run(async()=>{closeLogs();await call('SaveConfig',$('client').value,$('secret').value);clearResourceMonitoring();resetUsage();$('secret').value='';$('runtimes').replaceChildren(empty('未连接','设置已更新，请重新授权。'));await status();note('设置已保存。请点击浏览器授权。')});$('login').onclick=()=>run(async()=>{note('请在浏览器完成 Google 授权，最多等待 3 分钟…');closeLogs();await call('Login');clearResourceMonitoring();await status();await refresh()});$('logout').onclick=()=>run(async()=>{setView('profile');await call('Disconnect');clearResourceMonitoring();cpuSnapshots.clear();resetUsage();$('codeArea').hidden=true;$('authCode').value='';await status();$('count').textContent='';$('updated').textContent='尚未刷新';$('runtimes').replaceChildren(empty('已断开连接','本机授权已清除。'));note('已断开连接；Google 侧授权可在账号设置中撤销。')});$('accountSettingsNav').onclick=()=>setView('account');$('closeAccount').onclick=()=>{setView('overview');$('overviewNav').focus()};$('overviewNav').onclick=()=>setView('overview');$('refresh').onclick=()=>run(refresh);setView('overview');status().then(()=>{if(connected)run(refresh);else if(currentView==='overview')$('accountSettingsNav').click()}).catch(e=>note(String(e)));
 
 // Service management owns no generation UI; Toybox opens in the system browser.
-let serviceSnapshot=null,servicePollBusy=false,ruleLoaded=false,machineConfigGeneration=0,driveAuthGeneration=0,driveAuthPending=false,driveAuthPreparing=false,driveAuthID='',driveIsConnected=false,driveAccountMismatch=false,driveFolderID='',webAccessReady=false,webAccessRuntime='';
+let serviceSnapshot=null,servicePollBusy=false,ruleLoaded=false,machineConfigGeneration=0,driveAuthGeneration=0,driveAuthPending=false,driveAuthPreparing=false,driveAuthID='',driveIsConnected=false,driveAccountMismatch=false,driveFolderID='',webAccessReady=false,webAccessRuntime='',tunnelURLDirty=false,tunnelStatusLoaded=false,tunnelFeedbackAt=0;
 const serviceStates={stopped:'未启动',allocated:'机器已唤醒',allocating:'申请中',uncertain:'申请待核对',installing:'部署中',starting:'启动中',online:'在线',draining:'等待任务完成',backing_up:'保存中',backup_ready:'备份就绪',releasing:'释放中',failed:'部署失败',disconnected:'连接异常',lost:'实例已结束'};
 function serviceDate(value){const d=new Date(value);return !value||d.getFullYear()<2000?'尚未记录':d.toLocaleString('zh-CN')}
 let serviceRead=call,driveStatusPollBusy=false,webAccessPollBusy=false,progressPollBusy=false;
@@ -69,19 +69,19 @@ $('servicesNav').onclick=()=>{setView('services');serviceStatus()};$('automation
 $('serviceRefresh').onclick=()=>run(async()=>{await call('RefreshService');await serviceStatus()});
 function selectServiceTab(name){for(const tab of document.querySelectorAll('.services-tab')){const on=tab.dataset.tab===name;tab.classList.toggle('active',on);tab.setAttribute('aria-selected',String(on))}for(const pane of document.querySelectorAll('[data-service-pane]'))pane.hidden=pane.dataset.servicePane!==name;if(name==='logs')loadServiceLogs(true)}
 document.querySelectorAll('.services-tab').forEach(tab=>tab.onclick=()=>selectServiceTab(tab.dataset.tab));
-$('startToybox').onclick=async()=>{const outdated=isRemoteOutdated(serviceSnapshot);const title=outdated?'热升级原实例 Toybox？':'启动 H3 Toybox？';const detail=outdated?'将在任务空闲时原地热替换监督进程并更新 Toybox 网页端（保留已下载模型、ComfyUI 引擎、公网地址与现有作品），不申请新实例。':'将使用 '+(serviceSnapshot?.accelerator||'L4')+'，尚无机器时会申请计费实例，并下载约 60 GB 模型。已有同服务实例时复用；不会自动升级 GPU。网页访问需要密码。';if(await confirmAction(title,detail))run(async()=>{await call('StartToybox',true);note(outdated?'正在热升级原实例监督进程与网页端；具体阶段会显示在部署区域。':'正在检查启动条件；具体阶段和错误会显示在部署区域。');await serviceStatus();if(currentView==='services')$('progressPhase').closest('.deployment-progress').scrollIntoView({block:'center'})})};
+$('startToybox').onclick=async()=>{const outdated=isRemoteOutdated(serviceSnapshot);const tunnelOnly=outdated&&serviceSnapshot?.remoteVersion===serviceSnapshot?.version&&!!serviceSnapshot?.namedTunnel;const title=tunnelOnly?'热升级并切换固定隧道？':outdated?'热升级原实例 Toybox？':'启动 H3 Toybox？';const detail=tunnelOnly?'将原地热替换远端监督进程并切换为 Cloudflare Named Tunnel（不中断运行中的 ComfyUI、模型与生成任务），不申请新实例。':outdated?'将在任务空闲时原地热替换监督进程并更新 Toybox 网页端（保留已下载模型、ComfyUI 引擎、公网地址与现有作品），不申请新实例。':'将使用 '+(serviceSnapshot?.accelerator||'L4')+'，尚无机器时会申请计费实例，并下载约 60 GB 模型。已有同服务实例时复用；不会自动升级 GPU。网页访问需要密码。';if(await confirmAction(title,detail))run(async()=>{await call('StartToybox',true);note(tunnelOnly?'正在热替换远端监督进程并切换 Cloudflare Named Tunnel；具体阶段会显示在部署区域。':outdated?'正在热升级原实例监督进程与网页端；具体阶段会显示在部署区域。':'正在检查启动条件；具体阶段和错误会显示在部署区域。');await serviceStatus();if(currentView==='services')$('progressPhase').closest('.deployment-progress').scrollIntoView({block:'center'})})};
 $('openToybox').onclick=()=>run(async()=>{await call('OpenToybox')});
 $('copyToyboxURL').onclick=()=>run(async()=>{await call('CopyToyboxURL');note('Toybox 访问地址已复制，登录时使用访问密码。')});
 $('stopToybox').onclick=async()=>{const empty=serviceSnapshot?.runtime&&!serviceSnapshot?.remoteRoot;if(await confirmAction(empty?'释放已唤醒的机器？':'保存作品并释放 Toybox？',empty?'这台机器尚未部署服务，正在计费。释放会丢失机器上的临时数据，确认释放？':'停止接收新任务，等待已有任务完成，再保存到 Google Drive。只有校验成功才释放；失败时实例仍可能计费。'))run(async()=>{await call('StopToybox',true);await serviceStatus()})};
-$('retryToybox').onclick=async()=>{const outdated=isRemoteOutdated(serviceSnapshot);const title=outdated?'在原实例热升级部署？':'在原实例继续部署？';const detail=outdated?'仅在任务空闲时热替换旧版监督进程并更新 Toybox 网页端，保留已下载模型与现有作品，不申请第二台实例。':'仅使用已记录的实例，不申请第二台。同版本监督进程仍在线时会拒绝重复部署；可先查看日志。';if(await confirmAction(title,detail))run(async()=>{await call('RetryToybox',true);await serviceStatus()})};
+$('retryToybox').onclick=async()=>{const outdated=isRemoteOutdated(serviceSnapshot);const tunnelOnly=outdated&&serviceSnapshot?.remoteVersion===serviceSnapshot?.version&&!!serviceSnapshot?.namedTunnel;const title=tunnelOnly?'在原实例切换固定隧道？':outdated?'在原实例热升级部署？':'在原实例继续部署？';const detail=tunnelOnly?'将仅热替换远端监督进程并切换为 Cloudflare Named Tunnel，不中断运行中的模型与任务，不申请第二台实例。':outdated?'仅在任务空闲时热替换旧版监督进程并更新 Toybox 网页端，保留已下载模型与现有作品，不申请第二台实例。':'仅使用已记录的实例，不申请第二台。同版本监督进程仍在线时会拒绝重复部署；可先查看日志。';if(await confirmAction(title,detail))run(async()=>{await call('RetryToybox',true);await serviceStatus()})};
 $('connectDrive').onclick=()=>beginDriveAuth();$('useEasyColabDrive').onclick=()=>run(async()=>{await call('UseEasyColabDrive');applyDriveStatus(await call('DriveStatus'));await serviceStatus();note('已使用 EasyColab 的 Drive 授权，可以唤醒并启动。')});$('cancelDriveLogin').onclick=()=>cancelDriveAuth();$('submitDriveCode').onclick=()=>submitDriveAuthCode();
 $('openDriveFolder').onclick=()=>run(async()=>{note('正在定位或创建 Drive 保存目录…');await call('OpenDriveFolder');applyDriveStatus(await call('DriveStatus'));note('已打开保存目录。')});
 $('serviceLogsRefresh').onclick=()=>run(()=>loadServiceLogs(false));
 $('ruleForm').onsubmit=async e=>{e.preventDefault();const r={enabled:$('ruleEnabled').checked,days:Array.from(document.querySelectorAll('[name=weekday]:checked'),el=>Number(el.value)),start:$('ruleStart').value,end:$('ruleEnd').value,zone:$('ruleZone').value};if(r.enabled&&!await confirmAction('启用自动运行规则？','按选定日期和时区自动申请计费 '+(serviceSnapshot?.accelerator||'L4')+'，结束时等待任务、保存 Drive 后释放。仅 App 在菜单栏运行且 Mac 可联网时执行，不补开错过的时段。'))return;run(async()=>{await call('SaveServiceRule',r,true);await serviceStatus();note('规则已保存，从下一个开始时间执行。')})};
 setView('services');serviceStatus();setInterval(()=>{if(!document.hidden&&(currentView==='services'||currentView==='automation'))serviceStatus()},5000);
 
-function isRemoteOutdated(r){return !!(r&&r.runtime&&r.remoteRoot&&r.remoteVersion&&r.version&&r.remoteVersion!==r.version)}
-function applyServiceControls(){const r=serviceSnapshot;if(!r)return;const outdated=isRemoteOutdated(r);$('machineType').value=r.accelerator||'L4';$('selectedMachineName').textContent=(r.accelerator||'L4')+' GPU';$('machineType').disabled=busy||!r.manager||!!r.runtime||!!r.operation;$('machineTypeHint').textContent=r.runtime||r.operation?'机器已分配或申请待确认，类型已锁定。':'手动和定时启动均使用此类型，不自动更换 GPU。';$('openToybox').disabled=busy||!r.url||!r.runtime||r.stopRequested||!webAccessReady;$('stopToybox').disabled=busy||!r.runtime||r.stopRequested;$('startToybox').disabled=busy||!!r.operating||!r.manager||!r.drive;$('wakeToybox').disabled=busy||!r.manager||!!r.runtime;$('stopToybox').textContent=r.runtime&&!r.remoteRoot?'释放机器':'停止并释放';$('startToybox').textContent=!r.runtime?'唤醒并启动':outdated?'热升级服务':'部署并启动';$('retryToybox').textContent=outdated?'在原实例热升级部署':'在原实例继续部署';$('retryToybox').disabled=busy||!!r.operating||!r.runtime||!r.remoteRoot||!r.drive||r.stopRequested;$('applyToyboxAccess').disabled=busy||!r.runtime||!r.remoteRoot||r.stopRequested;$('rotateToyboxAPIToken').disabled=busy||!r.runtime||!r.remoteRoot||r.stopRequested;$('copyToyboxAPIBaseURL').disabled=busy||!$('toyboxAPIBaseURL').value;renderServiceReadiness(r)}
+function isRemoteOutdated(r){return !!(r&&r.runtime&&r.remoteRoot&&(r.remoteOutdated||(r.remoteVersion&&r.version&&r.remoteVersion!==r.version)))}
+function applyServiceControls(){const r=serviceSnapshot;if(!r)return;const outdated=isRemoteOutdated(r);$('machineType').value=r.accelerator||'L4';$('selectedMachineName').textContent=(r.accelerator||'L4')+' GPU';$('machineType').disabled=busy||!r.manager||!!r.runtime||!!r.operation;$('machineTypeHint').textContent=r.runtime||r.operation?'机器已分配或申请待确认，类型已锁定。':'手动和定时启动均使用此类型，不自动更换 GPU。';$('openToybox').disabled=busy||!r.url||!r.runtime||r.stopRequested||!webAccessReady;$('stopToybox').disabled=busy||!r.runtime||r.stopRequested;$('startToybox').disabled=busy||!!r.operating||!r.manager||!r.drive;$('wakeToybox').disabled=busy||!r.manager||!!r.runtime;$('stopToybox').textContent=r.runtime&&!r.remoteRoot?'释放机器':'停止并释放';$('startToybox').textContent=!r.runtime?'唤醒并启动':outdated?'热升级服务':'部署并启动';$('retryToybox').textContent=outdated?'在原实例热升级部署':'在原实例继续部署';$('retryToybox').disabled=busy||!!r.operating||!r.runtime||!r.remoteRoot||!r.drive||r.stopRequested;$('applyToyboxAccess').disabled=busy||!r.runtime||!r.remoteRoot||r.stopRequested;$('rotateToyboxAPIToken').disabled=busy||!r.runtime||!r.remoteRoot||r.stopRequested;$('copyToyboxAPIBaseURL').disabled=busy||!$('toyboxAPIBaseURL').value;renderTunnelConfig(r);renderServiceReadiness(r)}
 
 $('importDriveClient').onclick=()=>run(async()=>{await call('ImportDriveClient');applyDriveStatus(await call('DriveStatus'));note('Drive client 已导入，请重新点击连接 Google Drive。')});
 
@@ -92,7 +92,21 @@ $('wakeToybox').onclick=async()=>{if(await confirmAction('唤醒 '+(serviceSnaps
 
 var readinessProgress=null,readinessInstance='',readinessUnavailable=false;
 function readinessLabel(id,text,tone){$(id).textContent=text;$(id).dataset.state=tone||'waiting'}
-function validToyboxURL(value){return typeof value==='string'&&/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(value)?value:''}
+function validToyboxURL(value){if(typeof value!=='string'||!value)return '';if(/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(value))return value;const custom=serviceSnapshot?.namedTunnel?serviceSnapshot.tunnelURL||'':'';return custom&&/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(custom)&&value===custom?value:''}
+function renderTunnelConfig(r){
+ r=r||{};const named=!!(r.namedTunnel&&r.tunnelURL),hasAny=!!(r.tunnelURL||r.tunnelHasToken),pendingUpgrade=named&&!!r.runtime&&!!r.remoteRoot&&(!!r.remoteOutdated||/\.trycloudflare\.com$/.test(r.url||''));
+ $('monitorTunnelBadge').textContent=pendingUpgrade?'Named Tunnel · 待热升级切换':named?'Named Tunnel 固定域名':'默认临时隧道';
+ $('tunnelModeBadge').textContent=named?'Named Tunnel · 已启用':'默认临时隧道';
+ $('tunnelModeBadge').dataset.active=String(named);
+ $('toyboxURL').placeholder=named&&r.tunnelURL?('Named Tunnel 固定域名 '+r.tunnelURL):'网页连接启动后自动显示 https://…trycloudflare.com';
+ $('tunnelTokenInput').placeholder=r.tunnelHasToken?'已加密保存 Tunnel Token（留空保持不变，粘贴新值可覆盖）':'粘贴 eyJ… 令牌或完整 install 命令';
+ if(!tunnelStatusLoaded||(!tunnelURLDirty&&document.activeElement!==$('tunnelCustomURL'))){$('tunnelCustomURL').value=r.tunnelURL||'';tunnelURLDirty=false;tunnelStatusLoaded=true}
+ $('saveTunnelConfig').disabled=busy||!!r.operating;
+ $('clearTunnelConfig').disabled=busy||!!r.operating||!hasAny;
+ if(Date.now()-tunnelFeedbackAt>15000){
+  $('tunnelConfigMessage').textContent=named?('已配置 Cloudflare Named Tunnel（'+r.tunnelURL+'），部署或启动时优先使用；已运行新版监督进程时保存新配置将平滑热切换隧道。'):(r.tunnelURL&&!r.tunnelHasToken)?'已保存固定域名，请补充 Tunnel Token 后保存；当前仍走默认 *.trycloudflare.com 临时隧道。':'当前使用默认 *.trycloudflare.com 临时隧道；填写你的固定域名与 Tunnel Token 后将自动切换为 Named Tunnel。';
+ }
+}
 function markServiceReadinessUnavailable(key){if(key===readinessInstance){readinessUnavailable=true;renderServiceReadiness(serviceSnapshot)}}
 function renderServiceReadiness(r,result){
  r=r||{};const key=(r.runtime||'')+'/'+(r.remoteRoot||'');
@@ -118,7 +132,7 @@ function renderServiceReadiness(r,result){
  else if(hasMachine&&remote&&!fresh){title='状态待重新确认';detail='保留最后状态与地址，尚未确认当前在线。'}
  else if(remote?.stage==='failed'){title='部署失败';detail='请查看部署日志；机器可能仍在计费。';tone='error'}
  else if(healthy&&address&&webAccessReady){title='服务就绪，可打开网页';detail='ComfyUI 与 Toybox 健康检查通过，访问密码已启用。';tone='ready'}
- else if(healthy&&!address){title='服务已启动，等待访问地址';detail='正在等待网页隧道生成 HTTPS 地址。'}
+ else if(healthy&&!address){title='服务已启动，等待访问地址';detail=r.namedTunnel?'正在等待 Cloudflare Named Tunnel 建立固定域名连接。':'正在等待网页隧道生成 HTTPS 地址。'}
  else if(healthy){title='服务已启动，待确认网页鉴权';detail='地址已生成，等待网页进程确认密码保护。'}
  else if(remote?.stage==='online'){title='服务已启动，健康状态待确认';detail='尚未取得 ComfyUI 与 Toybox 健康检查通过记录，暂不确认可用。'}
  else if(hasMachine){title='服务准备中';detail=startupPhases?.[r.startupPhase]||deploymentPhases?.[p?.phase]||'等待远端健康检查与网页连接。'}
@@ -130,7 +144,7 @@ function renderServiceReadiness(r,result){
  $('copyToyboxURL').disabled=busy||!address||!hasMachine||!fresh;
  $('copyToyboxAPIBaseURL').disabled=busy||!baseURL;
  $('openToybox').disabled=busy||!healthy||!address||!webAccessReady;
- $('toyboxURLHint').textContent=!address?'地址尚未生成；网页连接启动后自动显示。':!fresh?'上次生成的地址，当前在线状态尚未确认。登录时使用访问密码。':'可复制地址到浏览器访问；需要访问密码。重建实例后地址可能改变。';
+ $('toyboxURLHint').textContent=!address?(r.namedTunnel&&r.tunnelURL?'已配置 Named Tunnel 固定域名 '+r.tunnelURL+'，等待远端隧道上线。':'地址尚未生成；网页连接启动后自动显示。'):!fresh?(r.namedTunnel?'Named Tunnel 上次固定地址，当前在线状态尚未确认。登录时使用访问密码。':'上次生成的地址，当前在线状态尚未确认。登录时使用访问密码。'):(r.namedTunnel?'Cloudflare Named Tunnel 固定地址，可复制或直接打开；需要访问密码，重建实例地址不变。':'可复制地址到浏览器访问；需要访问密码。重建实例后地址可能改变。');
 }
 function updateModelMemoryEvidence(name,r){if(serviceSnapshot?.runtime!==name)return;const gpu=r.gpus?.[0];$('modelMemoryEvidence').textContent=numeric(gpu?.memoryUsedBytes)&&numeric(gpu?.memoryTotalBytes)?'显存采样 '+(gpu.memoryUsedBytes/1073741824).toFixed(1)+' / '+(gpu.memoryTotalBytes/1073741824).toFixed(1)+' GiB · '+new Date().toLocaleTimeString('zh-CN'):'当前显存占用未提供'}
 
@@ -208,3 +222,30 @@ $('copyToyboxAPIToken').onclick=()=>run(async()=>{await call('CopyToyboxAPIToken
 $('copyToyboxAPIBaseURL').onclick=()=>run(async()=>{await call('CopyToyboxAPIBaseURL');note('OpenAI API Base URL 已复制。')});
 $('rotateToyboxAPIToken').onclick=async()=>{if(await confirmAction('轮换 OpenAI API Token？','将生成新 API Token 并同步到远程实例（仅在任务空闲时操作，必要时短暂重启 Toybox 网页进程）。旧 Token 将立即失效，网页登录密码保持不变。'))run(async()=>{note('正在轮换 API Token，请稍候…');await call('RotateToyboxAPIToken',true);$('toyboxAPIToken').value='';$('toyboxAPIToken').type='password';$('showToyboxAPIToken').textContent='查看 Token';await updateWebAccessStatus(serviceSnapshot);note('OpenAI API Token 已轮换并同步。')})};
 $('applyToyboxAccess').onclick=async()=>{if(await confirmAction('启用或更新网页与 API 鉴权？','仅在任务空闲时操作，必要时短暂重启 Toybox 网页进程，ComfyUI 和机器不重建。已有浏览器会话可能需要重新登录；有任务时会拒绝更新。'))run(async()=>{note('正在启用鉴权配置，请稍候…');await call('ApplyToyboxAccess',true);await updateWebAccessStatus(serviceSnapshot);note('鉴权配置已应用，等待服务确认。')})};
+$('tunnelCustomURL').oninput=()=>{tunnelURLDirty=true};
+$('gotoTunnelConfig').onclick=()=>{setView('services');selectServiceTab('assets');const panel=$('tunnelConfigPanel');panel.scrollIntoView({behavior:'smooth',block:'center'});$('tunnelCustomURL').focus()};
+$('toggleTunnelToken').onclick=()=>{const field=$('tunnelTokenInput');if(field.type==='text'){field.type='password';$('toggleTunnelToken').textContent='显示';return}field.type='text';$('toggleTunnelToken').textContent='隐藏'};
+$('saveTunnelConfig').onclick=async()=>{
+ if(serviceSnapshot?.runtime&&serviceSnapshot?.remoteRoot&&!await confirmAction('保存并同步 Cloudflare Named Tunnel？','将加密保存 Tunnel Token 与固定域名；若远端运行新版监督进程，会平滑重启 cloudflared 隧道（约 1-2 秒，不影响 ComfyUI 与 Toybox 网页进程）。'))return;
+ run(async()=>{
+  const res=await call('SaveTunnelConfig',$('tunnelCustomURL').value,$('tunnelTokenInput').value);
+  tunnelURLDirty=false;tunnelFeedbackAt=Date.now();
+  $('tunnelTokenInput').value='';$('tunnelTokenInput').type='password';$('toggleTunnelToken').textContent='显示';
+  if(res.url)$('tunnelCustomURL').value=res.url;
+  $('tunnelConfigMessage').textContent=res.message||'固定隧道配置已保存。';
+  note(res.message||'固定隧道配置已保存。');
+  await serviceStatus();
+ });
+};
+$('clearTunnelConfig').onclick=async()=>{
+ const msg=serviceSnapshot?.runtime&&serviceSnapshot?.remoteRoot?'将删除本机保存的 Tunnel Token 与固定域名，并通知运行中的实例切换回 *.trycloudflare.com 临时隧道（约 1-2 秒，不影响已加载模型与任务）。':'将删除本机保存的 Tunnel Token 与固定域名，后续启动恢复使用默认 *.trycloudflare.com 临时隧道。';
+ if(!await confirmAction('恢复默认临时隧道？',msg))return;
+ run(async()=>{
+  const res=await call('ClearTunnelConfig');
+  tunnelURLDirty=false;tunnelFeedbackAt=Date.now();
+  $('tunnelCustomURL').value='';$('tunnelTokenInput').value='';$('tunnelTokenInput').type='password';$('toggleTunnelToken').textContent='显示';
+  $('tunnelConfigMessage').textContent=res.message||'已恢复默认临时隧道。';
+  note(res.message||'已恢复默认临时隧道。');
+  await serviceStatus();
+ });
+};

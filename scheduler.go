@@ -280,11 +280,11 @@ func (s *Studio) OpenToybox() error {
 	if e != nil {
 		return e
 	}
-	readiness := readinessFromState(state, time.Now())
+	readiness := readinessFromState(state, time.Now(), r.TunnelURL)
 	if !readiness.Fresh || !readiness.Health || state.Stage != "online" {
 		return errors.New("服务尚未确认就绪，请查看服务状态后再打开网页")
 	}
-	u, e := urlForToybox(state.URL)
+	u, e := urlForToyboxWithCustom(state.URL, r.TunnelURL)
 	if e != nil {
 		return e
 	}

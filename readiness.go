@@ -22,10 +22,10 @@ func (s *Studio) CopyToyboxURL() error {
 	if e != nil {
 		return e
 	}
-	if !readinessFromState(state, time.Now()).Fresh {
+	if !readinessFromState(state, time.Now(), r.TunnelURL).Fresh {
 		return errors.New("服务状态已过期，请刷新后再复制访问地址")
 	}
-	address, e := urlForToybox(state.URL)
+	address, e := urlForToyboxWithCustom(state.URL, r.TunnelURL)
 	if e != nil {
 		return e
 	}

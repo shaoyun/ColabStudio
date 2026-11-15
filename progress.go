@@ -101,7 +101,7 @@ func readProgressLog(p runtimeProxy, root, kind string) (string, error) {
 	if e != nil || len(b) > 65536 {
 		return "", errors.New("日志范围读取未确认")
 	}
-	return redactLog(string(b), p.Token), nil
+	return redactLog(string(b), append(tunnelRedactionSecrets(), p.Token)...), nil
 }
 func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 	r := s.services().get()
@@ -127,7 +127,10 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 	if !validRemoteVersion(owner.Version) {
 		return result, errors.New("远端服务版本标记无效，未读取进度")
 	}
-	result.Remote = readinessFromState(owner, time.Now())
+	result.Remote = readinessFromState(owner, time.Now(), r.TunnelURL)
+	if result.Remote != nil && remoteTunnelNeedsUpgrade(r, owner) {
+		result.Remote.Outdated = true
+	}
 	var progress TransferProgress
 	if e = remoteJSON(p, r.RemoteRoot, "progress.json", &progress); e == nil {
 		if e = validateTransfer(&progress); e != nil {
@@ -176,6 +179,8 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 		result.Message = "远端心跳已过期，进度可能不是最新状态"
 	} else if result.Message == "" && owner.Version != toyboxVersion {
 		result.Message = "远端当前运行旧版本 " + shortVersion(owner.Version) + "，进度读取与备份停止均正常可用；任务空闲时可热升级至 " + shortVersion(toyboxVersion)
+	} else if result.Message == "" && remoteTunnelNeedsUpgrade(r, owner) {
+		result.Message = "当前实例运行旧版临时隧道监督进程；点击“热升级服务”即可不中断任务切换至已配置的固定域名"
 	}
 	return result, nil
 }
@@ -183,7 +188,7 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 func weightsVerified(p TransferProgress) bool {
 	return validateTransfer(&p) == nil && p.TotalFiles > 0 && p.VerifiedFiles == p.TotalFiles && p.TotalBytes > 0 && p.CompletedBytes == p.TotalBytes
 }
-func readinessFromState(r remoteState, now time.Time) *RemoteReadiness {
+func readinessFromState(r remoteState, now time.Time, customURL ...string) *RemoteReadiness {
 	age := float64(now.Unix()) - r.Heartbeat
 	out := &RemoteReadiness{
 		Stage:     r.Stage,
@@ -193,7 +198,11 @@ func readinessFromState(r remoteState, now time.Time) *RemoteReadiness {
 		Version:   r.Version,
 		Outdated:  validRemoteVersion(r.Version) && r.Version != toyboxVersion,
 	}
-	if address, e := urlForToybox(r.URL); e == nil {
+	var custom string
+	if len(customURL) > 0 {
+		custom = customURL[0]
+	}
+	if address, e := urlForToyboxWithCustom(r.URL, custom); e == nil {
 		out.URL = address
 	}
 	return out

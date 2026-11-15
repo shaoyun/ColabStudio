@@ -37,16 +37,17 @@ func shortVersion(v string) string {
 }
 
 type remoteState struct {
-	Owner     string        `json:"owner"`
-	Binding   string        `json:"binding"`
-	Version   string        `json:"version"`
-	Stage     string        `json:"stage"`
-	Message   string        `json:"message"`
-	Busy      bool          `json:"busy"`
-	Health    bool          `json:"health"`
-	URL       string        `json:"url"`
-	Heartbeat float64       `json:"heartbeat"`
-	Backup    *remoteBackup `json:"backup"`
+	Owner      string        `json:"owner"`
+	Binding    string        `json:"binding"`
+	Version    string        `json:"version"`
+	Stage      string        `json:"stage"`
+	Message    string        `json:"message"`
+	Busy       bool          `json:"busy"`
+	Health     bool          `json:"health"`
+	URL        string        `json:"url"`
+	TunnelMode string        `json:"tunnel_mode,omitempty"`
+	Heartbeat  float64       `json:"heartbeat"`
+	Backup     *remoteBackup `json:"backup"`
 }
 type remoteBackup struct {
 	File  string `json:"file"`
@@ -155,9 +156,17 @@ func remoteJSON(p runtimeProxy, root, name string, out any) error {
 	return nil
 }
 func stopRemoteSupervisor(p runtimeProxy, r ServiceRecord) error {
+	return stopRemoteSupervisorWithOptions(p, r, false)
+}
+
+func stopRemoteSupervisorWithOptions(p runtimeProxy, r ServiceRecord, allowBusy bool) error {
 	path, _ := json.Marshal("/content/.colabstudio/" + r.ID)
 	owner, _ := json.Marshal(r.ID)
 	binding, _ := json.Marshal(r.Binding)
+	allowLiteral := "False"
+	if allowBusy {
+		allowLiteral = "True"
+	}
 	nonce, _ := json.Marshal(random())
 	code := fmt.Sprintf(`import fcntl,json,os,pathlib,signal,time,urllib.error,urllib.request
 def _stop_supervisor():
@@ -168,12 +177,15 @@ def _stop_supervisor():
     if dep.exists():
         c=json.loads(dep.read_text())
         assert c.get('id')==%s and c.get('binding')==%s,'owner mismatch'
-    assert not (p/'draining').exists(),'shutdown in progress'
+    assert not (p/'draining').exists() and not (p/'frozen').exists(),'shutdown in progress'
+    allow_busy=%s
     st_file=p/'state.json'
     if st_file.exists():
         st=json.loads(st_file.read_text())
         assert st.get('owner')==%s and st.get('binding')==%s,'state owner mismatch'
-        if st.get('stage')=='online':
+        if allow_busy:
+            assert st.get('stage') not in ('installing','draining','backing_up','backup_ready'),'stage locked'
+        if st.get('stage')=='online' and not allow_busy:
             def get(port,path):
                 with urllib.request.urlopen('http://127.0.0.1:'+str(port)+path,timeout=8) as resp:
                     return json.load(resp)
@@ -263,7 +275,7 @@ def _stop_supervisor():
         except Exception:
             pass
 _stop_supervisor()
-`, string(path), string(owner), string(binding), string(owner), string(binding), string(nonce))
+`, string(path), string(owner), string(binding), allowLiteral, string(owner), string(binding), string(nonce))
 	if e := executeOwned(p, code); e != nil {
 		return errors.New("无法安全停止旧版监督进程（可能仍有任务运行或正在关闭），已取消升级；未改动原实例")
 	}
@@ -387,6 +399,27 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	if e = putRemote(p, root, "web-auth.json", authBytes); e != nil {
 		return m.fail(*r, e)
 	}
+	tunnelURL, tunnelTok, useNamed, e := loadNamedTunnel(*r)
+	if e != nil {
+		return m.fail(*r, e)
+	}
+	tcfg := remoteTunnelConfig{Mode: "quick"}
+	if useNamed {
+		tcfg = remoteTunnelConfig{Mode: "named", URL: tunnelURL, Token: tunnelTok}
+	}
+	if r.URL != "" {
+		if useNamed && r.URL != tunnelURL {
+			r.URL = ""
+		} else if !useNamed {
+			if _, qe := urlForToyboxWithCustom(r.URL, ""); qe != nil {
+				r.URL = ""
+			}
+		}
+	}
+	tunnelBytes, _ := json.Marshal(tcfg)
+	if e = putRemote(p, root, "tunnel.json", tunnelBytes); e != nil {
+		return m.fail(*r, e)
+	}
 
 	var existingData any
 	hasData := proxyRequest(httpClient, p, "GET", "api/contents/"+root+"/data", nil, &existingData) == nil
@@ -407,6 +440,7 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	}
 	r.State = "installing"
 	r.RemoteVersion = ""
+	r.RemoteOutdated = false
 	if m.ka != nil {
 		m.ka.syncRoot(p, r.Runtime, root)
 	}
@@ -445,6 +479,14 @@ func (m *serviceManager) state(r ServiceRecord) (remoteState, error) {
 	}
 	return v, nil
 }
+func (m *serviceManager) stateWithRetry(r ServiceRecord) (remoteState, error) {
+	v, e := m.state(r)
+	if e != nil && strings.Contains(e.Error(), "服务状态暂不可读") {
+		time.Sleep(time.Second)
+		return m.state(r)
+	}
+	return v, e
+}
 func (m *serviceManager) inspect(r *ServiceRecord) error {
 	if r.RemoteRoot == "" && r.Runtime != "" {
 		if _, e := m.studio.proxy(r.Runtime); e != nil {
@@ -465,14 +507,17 @@ func (m *serviceManager) inspect(r *ServiceRecord) error {
 	r.Message = map[string]string{"installing": "正在安装并校验模型，请查看部署日志", "starting": "正在启动服务", "online": "服务在线；网页访问需验证当前账号邮箱", "failed": "部署失败；实例可能仍在计费，请查看日志", "draining": "正在等待任务完成", "backing_up": "正在打包作品", "backup_ready": "正在等待 Drive 保存校验"}[v.Stage]
 	if !v.Health && v.Stage == "online" {
 		r.Message = "服务健康检查异常，暂不释放实例"
+	} else if v.Stage == "online" && v.Health && v.TunnelMode == "named" && v.URL == "" {
+		r.Message = "服务在线；正在建立 Cloudflare Named Tunnel 连接（若超过 15 秒未就绪，请查看“服务日志 → 隧道日志”核对 Token）"
 	}
-	if r.StartupError == "远端服务身份或版本不匹配，已暂停自动操作" || (v.Version == toyboxVersion && v.Stage == "online" && v.Health) {
+	if r.StartupError == "远端服务身份或版本不匹配，已暂停自动操作" || (v.Version == toyboxVersion && !remoteTunnelNeedsUpgrade(*r, v) && v.Stage == "online" && v.Health) {
 		r.StartupError = ""
 		if r.StartupPhase == "failed" {
 			r.StartupPhase = "done"
 		}
 	}
 	if v.Version != toyboxVersion {
+		r.RemoteOutdated = true
 		if v.Stage == "online" && v.Health {
 			r.Message = "服务在线（远端运行旧版本 " + shortVersion(v.Version) + "，空闲时可点击热升级更新至 " + shortVersion(toyboxVersion) + "，或直接停止并保存释放）"
 		} else if r.Message != "" {
@@ -480,10 +525,26 @@ func (m *serviceManager) inspect(r *ServiceRecord) error {
 		} else {
 			r.Message = "远端运行旧版本 " + shortVersion(v.Version)
 		}
+	} else if remoteTunnelNeedsUpgrade(*r, v) {
+		r.RemoteOutdated = true
+		if v.Stage == "online" && v.Health {
+			r.Message = "已配置固定域名，但当前实例仍运行旧版临时隧道；点击“热升级服务”即可平滑切换至 " + r.TunnelURL + "（不中断运行中的模型与任务）"
+		} else if r.Message != "" {
+			r.Message += "（待热升级以启用固定隧道）"
+		}
+	} else {
+		r.RemoteOutdated = false
 	}
 	if v.URL != "" {
-		if _, e = urlForToybox(v.URL); e == nil {
+		if _, e = urlForToyboxWithCustom(v.URL, r.TunnelURL); e == nil {
 			r.URL = v.URL
+		}
+	} else if v.TunnelMode != "" {
+		r.URL = ""
+	}
+	if r.URL != "" {
+		if _, e = urlForToyboxWithCustom(r.URL, r.TunnelURL); e != nil {
+			r.URL = ""
 		}
 	}
 	if !r.StopRequested {
@@ -560,6 +621,7 @@ func (m *serviceManager) finishStop(r *ServiceRecord) error {
 	r.BackupNonce = ""
 	r.RemoteRoot = ""
 	r.RemoteVersion = ""
+	r.RemoteOutdated = false
 	r.URL = ""
 	r.State = "stopped"
 	r.Message = "作品已保存到 Drive，实例已释放"
@@ -609,19 +671,17 @@ func (m *serviceManager) retryDeployment() (err error) {
 	if e = m.startStep(&r, "checking_runtime", "核对远端监督进程，避免重复安装"); e != nil {
 		return e
 	}
-	if v, e := m.state(r); e == nil && v.Version == toyboxVersion && v.Stage != "failed" {
-		return errors.New("监督进程仍在线，请查看日志；不重复执行安装")
+	if v, stateErr := m.stateWithRetry(r); stateErr == nil {
+		if v.Version == toyboxVersion && remoteTunnelNeedsUpgrade(r, v) && (v.Stage == "online" || v.Stage == "starting") {
+			return m.deployTunnelSupervisorOnly(&r)
+		}
+		if v.Version == toyboxVersion && !remoteTunnelNeedsUpgrade(r, v) && v.Stage != "failed" {
+			return errors.New("监督进程仍在线，请查看日志；不重复执行安装")
+		}
 	}
 	return m.deploy(&r)
 }
 
-func urlForToybox(address string) (string, error) {
-	u, e := url.Parse(address)
-	if e != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || !regexp.MustCompile(`^[a-z0-9-]+\.trycloudflare\.com$`).MatchString(u.Hostname()) || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return "", errors.New("服务尚无已确认的安全网页地址，请刷新状态")
-	}
-	return u.String(), nil
-}
 func openToyboxBrowser(u string) error { return mygo.Shell.OpenExternal(u) }
 func (s *Studio) ToyboxLogs(kind string) (string, error) {
 	m := s.services()
@@ -657,10 +717,11 @@ func (s *Studio) ToyboxLogs(kind string) (string, error) {
 	if e != nil || len(b) > 65536 {
 		return "", errors.New("日志过大且不支持范围读取，已停止下载")
 	}
+	secrets := append(tunnelRedactionSecrets(), p.Token)
 	if kind == "deployment" && r.StartupLog != "" {
-		return r.StartupLog + "\n──── 远端部署日志 ────\n" + redactLog(string(b), p.Token), nil
+		return r.StartupLog + "\n──── 远端部署日志 ────\n" + redactLog(string(b), secrets...), nil
 	}
-	return redactLog(string(b), p.Token), nil
+	return redactLog(string(b), secrets...), nil
 }
 
 // Keep archive transfers bounded on disk, never place proxy tokens in browser URLs.
@@ -810,6 +871,7 @@ func (m *serviceManager) reconcileGone(r *ServiceRecord) (bool, error) {
 	r.BackupNonce = ""
 	r.RemoteRoot = ""
 	r.RemoteVersion = ""
+	r.RemoteOutdated = false
 	r.URL = ""
 	r.RunningWindow = ""
 	if key, active, _ := ruleWindow(r.Rule, time.Now()); active {
@@ -851,6 +913,7 @@ func (m *serviceManager) releaseUninstalled(r *ServiceRecord) error {
 	r.StopRequested = false
 	r.RunningWindow = ""
 	r.RemoteVersion = ""
+	r.RemoteOutdated = false
 	r.State = "stopped"
 	r.Message = "机器已释放，未部署服务"
 	return m.put(*r)

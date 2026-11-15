@@ -49,18 +49,22 @@ type ServiceRecord struct {
 	Folder        string      `json:"folder"`
 	Archive       string      `json:"archive"`
 	BackupTime    time.Time   `json:"backupTime"`
-	RemoteRoot    string      `json:"remoteRoot"`
-	RemoteVersion string      `json:"remoteVersion,omitempty"`
-	BackupNonce   string      `json:"backupNonce"`
+	RemoteRoot     string      `json:"remoteRoot"`
+	RemoteVersion  string      `json:"remoteVersion,omitempty"`
+	RemoteOutdated bool        `json:"remoteOutdated,omitempty"`
+	BackupNonce    string      `json:"backupNonce"`
+	TunnelURL      string      `json:"tunnelURL,omitempty"`
 }
 type ServiceStatus struct {
 	Operating bool `json:"operating"`
 	ServiceRecord
-	Manager      bool   `json:"manager"`
-	Drive        bool   `json:"drive"`
-	DriveAccount string `json:"driveAccount"`
-	Next         string `json:"next"`
-	Version      string `json:"version"`
+	Manager        bool   `json:"manager"`
+	Drive          bool   `json:"drive"`
+	DriveAccount   string `json:"driveAccount"`
+	Next           string `json:"next"`
+	Version        string `json:"version"`
+	NamedTunnel    bool   `json:"namedTunnel"`
+	TunnelHasToken bool   `json:"tunnelHasToken,omitempty"`
 }
 type serviceManager struct {
 	metricsAttempt time.Time
@@ -198,7 +202,16 @@ func (s *Studio) ServiceStatus() ServiceStatus {
 	if r.Folder == "" {
 		r.Folder = d.Folder
 	}
-	result := ServiceStatus{ServiceRecord: r, Manager: m.err == nil, Drive: d.Refresh != "" || d.Rclone != "", DriveAccount: d.Email, Version: toyboxVersion}
+	namedTunnel, hasToken := namedTunnelActive(r)
+	result := ServiceStatus{
+		ServiceRecord:  r,
+		Manager:        m.err == nil,
+		Drive:          d.Refresh != "" || d.Rclone != "",
+		DriveAccount:   d.Email,
+		Version:        toyboxVersion,
+		NamedTunnel:    namedTunnel,
+		TunnelHasToken: hasToken,
+	}
 	if m.err != nil {
 		result.Message = m.err.Error()
 	}
@@ -271,7 +284,14 @@ func (m *serviceManager) start(scheduled bool) (err error) {
 		return m.deploy(&r)
 	}
 	if !scheduled && !r.StopRequested {
-		if v, stateErr := m.state(r); stateErr == nil && v.Version != toyboxVersion {
+		v, stateErr := m.stateWithRetry(r)
+		if stateErr != nil {
+			return m.fail(r, stateErr)
+		}
+		if v.Version == toyboxVersion && remoteTunnelNeedsUpgrade(r, v) && (v.Stage == "online" || v.Stage == "starting") {
+			return m.deployTunnelSupervisorOnly(&r)
+		}
+		if v.Version != toyboxVersion || remoteTunnelNeedsUpgrade(r, v) {
 			return m.deploy(&r)
 		}
 	}
