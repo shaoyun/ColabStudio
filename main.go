@@ -1,19 +1,20 @@
+//go:build !headless
+
 package main
 
 import (
-	"embed"
 	"encoding/base64"
-	"github.com/egoist/mygo"
 	"log"
+	"os"
 	"strings"
+
+	"github.com/egoist/mygo"
 )
 
-//go:embed web/*
-var assets embed.FS
-
-var activeStudio = &Studio{}
-
 func main() {
+	if shouldRunWebServer(os.Args[1:]) {
+		os.Exit(runWebServerCLI(os.Args[1:]))
+	}
 	mygo.Bind(activeStudio)
 	mygo.App.WhenReady(func() {
 		w := mygo.NewWindow(mygo.WindowOptions{Title: "Colab Studio", Width: 1120, Height: 780, TitleBarStyle: mygo.TitleBarHiddenInset})

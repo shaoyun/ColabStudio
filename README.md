@@ -269,3 +269,115 @@ open build/darwin-arm64/ColabStudio.app
 ComfyUI 与 Toybox 的健康检查通过、心跳有效、网页地址生成且访问密码确认后，显示“服务就绪，可打开网页”。地址栏可以选择文字，并提供复制地址、打开网页按钮；两项操作读取归属匹配的远端最新地址，不依赖可能滞后的本机缓存。地址不包含密码、proxy token 或 API key；重建机器后可能改变。状态过期时保留地址并标注未确认，停止宣称服务可用。打开网页仍保留密码保护检查。
 
 就绪区窗口验收见 `evidence/readiness-check.json` 和 `evidence/service-readiness-demo.png`（明确 Demo 数据）；后端使用隔离 HTTP 与模拟剪贴板测试验证，没有新建或重新部署计费实例。
+
+---
+
+## Linux Web 部署与远程控制 API
+
+除 macOS 桌面客户端（[scripts/build.sh](scripts/build.sh) 构建 `.app` 与 `.dmg`）外，ColabStudio 现已支持构建为 **无头（headless）Linux Web 服务**，并保留全部界面功能（无桌面环境 OAuth 授权、浏览器文件上传、`cloudflared` 固定域名隧道配置与 `rclone` 复用），同时暴露带 Token 认证的 HTTP REST 控制接口。
+
+### 1. 编译 Linux 静态二进制
+
+无头模式通过 `headless` 构建标签彻底隔离桌面 GUI / 钥匙串依赖，无需任何 X11 / WebView / CGO 系统库：
+
+```bash
+./scripts/build-linux.sh
+```
+
+默认输出纯静态 ELF 可执行文件：
+- `build/linux-amd64/colabstudio-server`
+- `build/linux-arm64/colabstudio-server`
+
+也可仅构建单一架构（如 `./scripts/build-linux.sh amd64`）。桌面客户端二进制同样支持临时传入 `-serve`（及可选 `-headless-vault`）以 Web 模式运行。
+
+### 2. 启动与 Token / 密钥管理
+
+直接运行（首次运行会自动生成强随机 `api.token` 与文件加密主密钥 `vault.key`，权限均为 `0600`；常规启动日志不会输出明文 Token）：
+
+```bash
+./colabstudio-server -listen 127.0.0.1:8787 -data-dir /var/lib/colabstudio
+```
+
+常用参数与对应环境变量：
+
+| 参数 | 环境变量 | 默认值 / 说明 |
+| --- | --- | --- |
+| `-listen` | `COLABSTUDIO_LISTEN` | `127.0.0.1:8787`（推荐配合反向代理使用 HTTPS） |
+| `-data-dir` | `COLABSTUDIO_DATA_DIR` | `~/.config/ColabStudio`，保存 `api.token`、`vault.key`、`credentials.enc` 与 `services.json` |
+| `-token` | `COLABSTUDIO_API_TOKEN` | 显式指定控制接口与 Web 解锁 API Token（至少 12 个非空白字符） |
+| `-print-token` | — | 读取（或首次生成并保存）API Token 打印到标准输出后退出 |
+| `-rotate-token` | — | 轮换生成新 API Token 并覆盖写入 `api.token`，既有浏览器 Cookie 随之失效 |
+| `-headless-vault` | `COLABSTUDIO_HEADLESS_VAULT` | 桌面二进制运行 `-serve` 时强制使用文件主密钥库替代系统钥匙串 |
+| — | `COLABSTUDIO_VAULT_KEY` | 可选外部主密钥（32 字节密钥的 64 位十六进制或 Base64），用于解耦 `vault.key` |
+
+查看当前服务端生成的 Token：
+
+```bash
+./colabstudio-server -data-dir /var/lib/colabstudio -print-token
+```
+
+### 3. systemd 部署示例
+
+仓内提供 [deploy/colabstudio.service](deploy/colabstudio.service) 模板（包含 `NoNewPrivileges`、`ProtectSystem=strict` 与 `StateDirectory=colabstudio` 等加固配置）：
+
+```bash
+sudo install -m 0755 build/linux-amd64/colabstudio-server /usr/local/bin/colabstudio-server
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin colabstudio || true
+sudo cp deploy/colabstudio.service /etc/systemd/system/colabstudio.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now colabstudio
+sudo -u colabstudio /usr/local/bin/colabstudio-server -data-dir /var/lib/colabstudio -print-token
+```
+
+> 安全提示：默认仅监听 `127.0.0.1:8787`。若需通过公网管理，请使用 Nginx / Caddy / Cloudflare Tunnel 终止 TLS 后反向代理至本机回环端口（并透传 `X-Forwarded-Proto: https` 与 `Host`）。
+
+### 4. 远程控制 REST API（Token 认证）
+
+除 `GET /api/v1/health` 外，所有 REST 与 RPC 接口均要求携带有效 Token：
+- 请求头 `Authorization: Bearer <TOKEN>` 或 `X-API-Token: <TOKEN>`（脚本调用推荐，免 CSRF 校验）
+- 或通过 Web 控制台输入 Token 登录换取 `HttpOnly; SameSite=Strict` 会话 Cookie（浏览器写请求额外强制校验 `X-Requested-With: ColabStudio` 与 `Origin`）
+- 禁止通过 `?token=...` URL 查询参数传递 Token（直接返回 `401`）；单 IP 每分钟鉴权失败超过 12 次触发 `429` 限流
+
+常用远程控制命令（将 `BASE` 替换为 `http://127.0.0.1:8787` 或你的 HTTPS 域名，`TOKEN` 替换为实际 Token）：
+
+```bash
+# 健康检查（免认证）
+curl -fsS "${BASE}/api/v1/health"
+
+# 查看 CU 消耗、剩余额度与预计可用小时数
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/cu"
+
+# 查看聚合状态（加 ?full=1 同时拉取实时 CU 与实例列表）
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/status?full=1"
+
+# 一键开启 Toybox（可指定 accelerator 如 L4/T4/A100，支持 wait:true 同步等待上线）
+curl -fsS -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"accelerator":"L4","wait":false}' \
+  "${BASE}/api/v1/toybox/start"
+
+# 一键安全停机（排空队列 -> 备份作品到 Drive -> 释放实例；传 force:true 可跳过备份立即强制释放）
+curl -fsS -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"force":false}' \
+  "${BASE}/api/v1/toybox/stop"
+
+# 查看所有已分配 Colab 实例
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/runtimes"
+
+# 一键释放指定实例或全部非托管实例
+#（默认保护 Toybox 托管实例防止误释放，返回 409 或在 all:true 中跳过；传 force:true 可强删）
+curl -fsS -X POST \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"all":true,"force":false}' \
+  "${BASE}/api/v1/runtimes/release"
+
+# 查询部署进度、服务日志与已部署 Toybox 的访问密码 / OpenAI API Token
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/toybox/progress"
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/toybox/logs?kind=deployment"
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE}/api/v1/toybox/credentials"
+```
+

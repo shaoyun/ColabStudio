@@ -8,8 +8,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/egoist/mygo"
 )
 
 const cloudflareTunnelTokenKey = "cloudflare-tunnel-token"
@@ -101,7 +99,7 @@ func normalizeTunnelToken(raw string) (string, error) {
 func storedTunnelToken() (string, bool, error) {
 	b, e := store.Get(cloudflareTunnelTokenKey)
 	if e != nil {
-		if errors.Is(e, mygo.ErrSecretNotFound) {
+		if errors.Is(e, errSecretNotFound) {
 			return "", false, nil
 		}
 		return "", false, errors.New("无法读取本机加密保存的 Tunnel Token：" + e.Error())

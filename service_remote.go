@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/egoist/mygo"
 	"golang.org/x/net/websocket"
 	"io"
 	"net/http"
@@ -682,7 +681,7 @@ func (m *serviceManager) retryDeployment() (err error) {
 	return m.deploy(&r)
 }
 
-func openToyboxBrowser(u string) error { return mygo.Shell.OpenExternal(u) }
+func openToyboxBrowser(u string) error { return platformOpenExternal(u) }
 func (s *Studio) ToyboxLogs(kind string) (string, error) {
 	m := s.services()
 	r := m.get()

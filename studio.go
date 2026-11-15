@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/egoist/mygo"
 	"io"
 	"net"
 	"net/http"
@@ -27,7 +26,7 @@ const scope = "https://www.googleapis.com/auth/colaboratory"
 const apiBase = "https://colaboratory.googleapis.com/v1beta/"
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
-var store = newCredentialVault(vaultPath(), mygo.Secrets.Service("dev.colabstudio.desktop"))
+var store = newCredentialVault(vaultPath(), defaultKeyStore())
 
 type Config struct {
 	Remote       bool   `json:"remote,omitempty"`
@@ -71,14 +70,12 @@ type Studio struct {
 	mu                sync.Mutex
 	login             bool
 	verifier          string
+	loginRedirect     string
+	loginState        string
 	remoteConfig      Config
 	remoteUntil       time.Time
 }
 
-func configPath() string {
-	d, _ := os.UserConfigDir()
-	return filepath.Join(d, "ColabStudio", "config.json")
-}
 func loadConfig() (Config, error) {
 	var c Config
 	b, e := os.ReadFile(configPath())
@@ -92,8 +89,8 @@ func loadConfig() (Config, error) {
 	b, e = store.Get("client-secret")
 	if e == nil {
 		c.ClientSecret = string(b)
-	} else if !errors.Is(e, mygo.ErrSecretNotFound) {
-		return c, errors.New("无法读取 Keychain，请允许访问后重试")
+	} else if !errors.Is(e, errSecretNotFound) {
+		return c, errors.New("无法读取加密密钥，请检查密钥存储后重试")
 	}
 	return c, nil
 }
@@ -129,6 +126,8 @@ func (s *Studio) SaveConfig(id, secret string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.verifier = ""
+	s.loginRedirect = ""
+	s.loginState = ""
 	s.remoteConfig = Config{}
 	s.compatible = false
 	id = strings.TrimSpace(id)
@@ -159,6 +158,8 @@ func (s *Studio) Disconnect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.verifier = ""
+	s.loginRedirect = ""
+	s.loginState = ""
 	s.remoteConfig = Config{}
 	s.compatible = false
 	if e := store.Delete("account-profile"); e != nil {
@@ -254,7 +255,7 @@ func (s *Studio) Login() error {
 	go server.Serve(ln)
 	defer server.Close()
 	q := url.Values{"client_id": {c.ClientID}, "redirect_uri": {redirect}, "response_type": {"code"}, "scope": {oauthScopes}, "state": {state}, "code_challenge": {base64.RawURLEncoding.EncodeToString(hash[:])}, "code_challenge_method": {"S256"}, "access_type": {"offline"}, "prompt": {"consent"}}
-	if e = mygo.Shell.OpenExternal("https://accounts.google.com/o/oauth2/v2/auth?" + q.Encode()); e != nil {
+	if e = platformOpenExternal("https://accounts.google.com/o/oauth2/v2/auth?" + q.Encode()); e != nil {
 		return errors.New("无法打开授权浏览器")
 	}
 	select {
@@ -435,29 +436,43 @@ func (s *Studio) Create(spec Spec) (string, error) {
 	}
 	return op.Name, nil
 }
-func (s *Studio) Open(name string) error {
+func (s *Studio) runtimeOpenURL(name string) (string, error) {
 	if strings.HasPrefix(name, "compat/") {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.compatibleOpen(name)
+		return s.compatibleURL(name)
 	}
 	if !runtimeName.MatchString(name) {
-		return errors.New("无效实例")
+		return "", errors.New("无效实例")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var r Runtime
 	if e := s.call("GET", name, nil, &r); e != nil {
+		return "", e
+	}
+	return validateRuntimeURL(r.ConnectionInfo.URL)
+}
+func (s *Studio) Open(name string) error {
+	u, e := s.runtimeOpenURL(name)
+	if e != nil {
 		return e
 	}
-	return openRuntimeURL(r.ConnectionInfo.URL)
+	return platformOpenExternal(u)
 }
-func openRuntimeURL(address string) error {
+func validateRuntimeURL(address string) (string, error) {
 	u, e := url.Parse(address)
 	if e != nil || u.Scheme != "https" || !(u.Hostname() == "googleusercontent.com" || strings.HasSuffix(u.Hostname(), ".googleusercontent.com") || u.Hostname() == "colab.research.google.com" || strings.HasSuffix(u.Hostname(), ".r.colab.dev")) {
-		return errors.New("实例没有可安全打开的 Google HTTPS 地址")
+		return "", errors.New("实例没有可安全打开的 Google HTTPS 地址")
 	}
-	return mygo.Shell.OpenExternal(u.String())
+	return u.String(), nil
+}
+func openRuntimeURL(address string) error {
+	u, e := validateRuntimeURL(address)
+	if e != nil {
+		return e
+	}
+	return platformOpenExternal(u)
 }
 
 // Operation reports completion without resubmitting a potentially billable request.

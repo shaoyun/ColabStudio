@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/egoist/mygo"
 	"io"
 	"net"
 	"net/http"
@@ -37,6 +36,8 @@ type driveGrant struct {
 type driveFlow struct {
 	Config                           Config
 	Verifier, State, Redirect, Email string
+	AuthURL                          string
+	WebManual                        bool
 	Until                            time.Time
 	ID                               string
 	Phase                            string
@@ -83,7 +84,7 @@ func driveAccess(_ string) (string, error) {
 
 var driveAuthProfile = func(s *Studio) (AccountProfile, error) { return s.Profile() }
 var driveAuthConfig = loadDriveOAuthConfig
-var driveAuthOpen = mygo.Shell.OpenExternal
+var driveAuthOpen = platformOpenExternal
 
 func loadDriveOAuthConfig() (Config, error) {
 	c, e := loadConfig()
@@ -141,16 +142,36 @@ func (s *Studio) CancelDriveLogin(id string) error {
 	return nil
 }
 func (s *Studio) BeginDriveLogin(id string) (bool, error) {
+	f, e := s.startDriveFlow(id, false)
+	if e != nil {
+		return false, e
+	}
+	return f.Config.Remote, nil
+}
+
+func (s *Studio) beginWebDriveLogin(id string) (map[string]any, error) {
+	f, e := s.startDriveFlow(id, true)
+	if e != nil {
+		return nil, e
+	}
+	return map[string]any{
+		"remote":          true,
+		"authURL":         f.AuthURL,
+		"desktopCallback": !f.Config.Remote,
+	}, nil
+}
+
+func (s *Studio) startDriveFlow(id string, webManual bool) (*driveFlow, error) {
 	if !regexp.MustCompile(`^[A-Za-z0-9_-]{8,100}$`).MatchString(id) {
-		return false, errors.New("授权请求标识无效，请重新点击连接 Drive")
+		return nil, errors.New("授权请求标识无效，请重新点击连接 Drive")
 	}
 	s.driveMu.Lock()
 	if s.driveFlow != nil && time.Now().Before(s.driveFlow.Until) {
 		s.driveMu.Unlock()
-		return false, errors.New("Drive 授权正在进行，可以取消本次授权后重新发起")
+		return nil, errors.New("Drive 授权正在进行，可以取消本次授权后重新发起")
 	}
 	old := s.driveFlow
-	f := &driveFlow{ID: id, Verifier: random(), State: random(), Until: time.Now().Add(5 * time.Minute), Phase: "preparing"}
+	f := &driveFlow{ID: id, Verifier: random(), State: random(), WebManual: webManual, Until: time.Now().Add(5 * time.Minute), Phase: "preparing"}
 	f.Timer = time.AfterFunc(5*time.Minute, func() { s.expireDriveFlow(f) })
 	s.driveFlow = f
 	s.driveAttemptEmail = ""
@@ -165,32 +186,44 @@ func (s *Studio) BeginDriveLogin(id string) (bool, error) {
 		}
 	}
 	if e != nil {
-		return false, s.driveFlowError(f, e.Error())
+		return nil, s.driveFlowError(f, e.Error())
 	}
 	c, e := driveAuthConfig()
 	if e != nil {
-		return false, s.driveFlowError(f, e.Error())
+		return nil, s.driveFlowError(f, e.Error())
 	}
 	var ln net.Listener
 	redirect := remoteRedirect
 	if !c.Remote {
-		ln, e = net.Listen("tcp4", "127.0.0.1:0")
-		if e != nil {
-			return false, s.driveFlowError(f, "无法创建 Drive 本地回调")
+		if webManual {
+			redirect = webDriveRedirect
+		} else {
+			ln, e = net.Listen("tcp4", "127.0.0.1:0")
+			if e != nil {
+				return nil, s.driveFlowError(f, "无法创建 Drive 本地回调")
+			}
+			redirect = "http://" + ln.Addr().String() + "/drive-callback"
 		}
-		redirect = "http://" + ln.Addr().String() + "/drive-callback"
 	}
+	hash := sha256.Sum256([]byte(f.Verifier))
+	q := url.Values{"client_id": {c.ClientID}, "redirect_uri": {redirect}, "response_type": {"code"}, "scope": {driveScope + " openid email profile"}, "state": {f.State}, "code_challenge": {base64.RawURLEncoding.EncodeToString(hash[:])}, "code_challenge_method": {"S256"}, "access_type": {"offline"}, "prompt": {"select_account consent"}, "login_hint": {p.Email}}
+	if c.Remote {
+		q.Set("token_usage", "remote")
+	}
+	authURL := "https://accounts.google.com/o/oauth2/v2/auth?" + q.Encode()
+
 	s.driveMu.Lock()
 	if s.driveFlow != f || time.Now().After(f.Until) {
 		s.driveMu.Unlock()
 		if ln != nil {
 			ln.Close()
 		}
-		return false, errors.New("本次 Drive 授权已取消，请使用新流程")
+		return nil, errors.New("本次 Drive 授权已取消，请使用新流程")
 	}
 	f.Config = c
 	f.Email = p.Email
 	f.Redirect = redirect
+	f.AuthURL = authURL
 	f.Phase = "browser"
 	if ln != nil {
 		server := &http.Server{ReadHeaderTimeout: 5 * time.Second}
@@ -212,24 +245,26 @@ func (s *Studio) BeginDriveLogin(id string) (bool, error) {
 		})
 		go server.Serve(ln)
 	}
-	s.driveMessage = "等待浏览器完成 Drive 授权；未弹出时可取消或重新发起"
-	s.driveMu.Unlock()
-	hash := sha256.Sum256([]byte(f.Verifier))
-	q := url.Values{"client_id": {c.ClientID}, "redirect_uri": {redirect}, "response_type": {"code"}, "scope": {driveScope + " openid email profile"}, "state": {f.State}, "code_challenge": {base64.RawURLEncoding.EncodeToString(hash[:])}, "code_challenge_method": {"S256"}, "access_type": {"offline"}, "prompt": {"select_account consent"}, "login_hint": {p.Email}}
-	if c.Remote {
-		q.Set("token_usage", "remote")
+	if webManual {
+		s.driveMessage = "请在浏览器完成 Drive 授权，将结果页授权码或完整回调地址粘贴回此处"
+	} else {
+		s.driveMessage = "等待浏览器完成 Drive 授权；未弹出时可取消或重新发起"
 	}
-	// Opening the browser never holds the flow mutex, so cancellation remains responsive.
-	if e = driveAuthOpen("https://accounts.google.com/o/oauth2/v2/auth?" + q.Encode()); e != nil {
-		return false, s.driveFlowError(f, "无法打开 Drive 授权浏览器，可重新发起")
+	s.driveMu.Unlock()
+
+	if !webManual {
+		// Opening the browser never holds the flow mutex, so cancellation remains responsive.
+		if e = driveAuthOpen(authURL); e != nil {
+			return nil, s.driveFlowError(f, "无法打开 Drive 授权浏览器，可重新发起")
+		}
 	}
 	s.driveMu.Lock()
 	active := s.driveFlow == f
 	s.driveMu.Unlock()
 	if !active {
-		return false, errors.New("本次 Drive 授权已取消，请使用新流程")
+		return nil, errors.New("本次 Drive 授权已取消，请使用新流程")
 	}
-	return c.Remote, nil
+	return f, nil
 }
 func (s *Studio) SubmitDriveCode(id, code string) error {
 	s.driveMu.Lock()
@@ -238,9 +273,9 @@ func (s *Studio) SubmitDriveCode(id, code string) error {
 	if f == nil || f.ID != id {
 		return errors.New("此授权码属于旧流程，请使用当前授权页面")
 	}
-	return s.completeDriveCodeFor(f, strings.TrimSpace(code))
+	return s.completeDriveCodeFor(f, code)
 }
-func (s *Studio) completeDriveCodeFor(f *driveFlow, code string) error {
+func (s *Studio) completeDriveCodeFor(f *driveFlow, codeInput string) error {
 	s.driveMu.Lock()
 	if f == nil || s.driveFlow != f || time.Now().After(f.Until) {
 		s.driveMu.Unlock()
@@ -250,9 +285,10 @@ func (s *Studio) completeDriveCodeFor(f *driveFlow, code string) error {
 		s.driveMu.Unlock()
 		return errors.New("Drive 授权正在准备或处理，请稍候，也可取消后重试")
 	}
-	if code == "" || len(code) > 4096 || strings.ContainsAny(code, "\r\n ") {
+	code, parseErr := extractOAuthCode(codeInput, f.State, "Drive 授权未获同意或授权码无效，可以重新发起")
+	if parseErr != nil {
 		s.driveMu.Unlock()
-		return s.driveFlowError(f, "Drive 授权未获同意或授权码无效，可以重新发起")
+		return s.driveFlowError(f, parseErr.Error())
 	}
 	f.Phase = "exchanging"
 	s.driveMessage = "正在验证 Drive 授权，可取消"
@@ -305,13 +341,15 @@ func (s *Studio) DriveStatus() map[string]any {
 	phase := ""
 	id := ""
 	remote := false
+	authURL := ""
 	until := time.Time{}
 	pending := false
 	if f != nil && time.Now().Before(f.Until) {
 		pending = true
 		id = f.ID
 		phase = f.Phase
-		remote = f.Config.Remote
+		remote = f.Config.Remote || f.WebManual
+		authURL = f.AuthURL
 		until = f.Until
 	}
 	s.driveMu.Unlock()
@@ -347,7 +385,11 @@ func (s *Studio) DriveStatus() map[string]any {
 			client = "独立 client · 项目 " + strings.SplitN(own.ClientID, "-", 2)[0]
 		}
 	}
-	return map[string]any{"client": client, "connected": connected, "email": d.Email, "expectedEmail": expected, "attemptEmail": attempt, "status": status, "folder": folder, "folderName": "H3-Toybox", "message": msg, "pending": pending, "id": id, "phase": phase, "remote": remote, "until": until}
+	out := map[string]any{"client": client, "connected": connected, "email": d.Email, "expectedEmail": expected, "attemptEmail": attempt, "status": status, "folder": folder, "folderName": "H3-Toybox", "message": msg, "pending": pending, "id": id, "phase": phase, "remote": remote, "until": until}
+	if pending && authURL != "" {
+		out["authURL"] = authURL
+	}
+	return out
 }
 
 var driveID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
@@ -613,46 +655,54 @@ func restoreDrive(p runtimeProxy, r ServiceRecord) error {
 	return putRemote(p, r.RemoteRoot, "restore.json", b)
 }
 
-var driveFolderOpen = mygo.Shell.OpenExternal
+var driveFolderOpen = platformOpenExternal
 
-func (s *Studio) OpenDriveFolder() error {
+func (s *Studio) ensureDriveFolderURL() (string, error) {
 	m := s.services()
 	if m.err != nil {
-		return m.err
+		return "", m.err
 	}
 	if !m.op.TryLock() {
-		return errors.New("服务操作正在进行，请稍后打开保存目录")
+		return "", errors.New("服务操作正在进行，请稍后打开保存目录")
 	}
 	defer m.op.Unlock()
 	r := m.get()
 	p, e := m.identity(r)
 	if e != nil {
-		return e
+		return "", e
 	}
 	token, e := driveAccess(p.Email)
 	if e != nil {
-		return e
+		return "", e
 	}
 	d, e := loadDriveGrant()
 	if e != nil {
-		return e
+		return "", e
 	}
 	folder := d.Folder
 	folder, e = driveFolder(token, folder)
 	if e != nil {
-		return e
+		return "", e
 	}
 	d.Folder = folder
 	if e = persistDrive(d); e != nil {
-		return e
+		return "", e
 	}
 	if r.Binding != "" {
 		r.Folder = folder
 		if e = m.put(r); e != nil {
-			return e
+			return "", e
 		}
 	}
-	return driveFolderOpen("https://drive.google.com/drive/folders/" + folder)
+	return "https://drive.google.com/drive/folders/" + folder, nil
+}
+
+func (s *Studio) OpenDriveFolder() error {
+	address, e := s.ensureDriveFolderURL()
+	if e != nil {
+		return e
+	}
+	return driveFolderOpen(address)
 }
 
 // Reuse a completed upload after an interrupted local response or release failure.
@@ -684,8 +734,11 @@ func findDriveBackup(token, folder, service, nonce, md5sum string, size int64) (
 // A separate Desktop client is optional when the reused Colab client's project
 // cannot enable Drive API. It never changes Colab's OAuth configuration.
 func (s *Studio) ImportDriveClient() error {
-	paths, e := mygo.Dialog.Open(mygo.OpenDialogOptions{Title: "选择 Drive Desktop OAuth client", Message: "选择已启用 Google Drive API 的自建 Desktop app JSON；不改变 Colab 登录。", Filters: []mygo.FileFilter{{Name: "OAuth JSON", Extensions: []string{"json"}}}})
+	paths, e := platformOpenJSONDialog("选择 Drive Desktop OAuth client", "选择已启用 Google Drive API 的自建 Desktop app JSON；不改变 Colab 登录。", false)
 	if e != nil {
+		if isWebServerMode() {
+			return e
+		}
 		return errors.New("无法打开 Drive 配置选择窗口")
 	}
 	if len(paths) == 0 {
@@ -695,6 +748,10 @@ func (s *Studio) ImportDriveClient() error {
 	if e != nil {
 		return errors.New("无法读取 Drive OAuth 配置")
 	}
+	return s.importDriveClientBytes(b)
+}
+
+func (s *Studio) importDriveClientBytes(b []byte) error {
 	var doc struct {
 		Installed Config `json:"installed"`
 	}
@@ -703,7 +760,7 @@ func (s *Studio) ImportDriveClient() error {
 	}
 	doc.Installed.Remote = false
 	value, _ := json.Marshal(doc.Installed)
-	if e = store.Set("drive-oauth-client", value); e != nil {
+	if e := store.Set("drive-oauth-client", value); e != nil {
 		return e
 	}
 	_ = s.CancelDriveLogin("")
@@ -718,12 +775,7 @@ var rcloneDriveConf = func() string {
 	return filepath.Join(h, ".config/easycolab/drive_rclone.conf")
 }
 
-// readRcloneDrive accepts only the single drive.file remote EasyColab uses.
-func readRcloneDrive(path string) (name, access string, until time.Time, err error) {
-	b, e := os.ReadFile(path)
-	if e != nil {
-		return "", "", until, errors.New("未找到 EasyColab 的 Drive 授权（~/.config/easycolab/drive_rclone.conf）")
-	}
+func parseRcloneDriveConf(b []byte) (name, access string, until time.Time, err error) {
 	kv, sections := map[string]string{}, 0
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
@@ -748,9 +800,18 @@ func readRcloneDrive(path string) (name, access string, until time.Time, err err
 	return name, t.Access, t.Expiry, nil
 }
 
+// readRcloneDrive accepts only the single drive.file remote EasyColab uses.
+func readRcloneDrive(path string) (name, access string, until time.Time, err error) {
+	b, e := os.ReadFile(path)
+	if e != nil {
+		return "", "", until, errors.New("未找到 EasyColab 的 Drive 授权（~/.config/easycolab/drive_rclone.conf）")
+	}
+	return parseRcloneDriveConf(b)
+}
+
 var rcloneRefresh = func(path, name string) error {
 	bin, e := exec.LookPath("rclone")
-	for _, p := range []string{"/opt/homebrew/bin/rclone", "/usr/local/bin/rclone"} {
+	for _, p := range []string{"/opt/homebrew/bin/rclone", "/usr/local/bin/rclone", "/usr/bin/rclone"} {
 		if e != nil {
 			if _, se := os.Stat(p); se == nil {
 				bin, e = p, nil
@@ -758,7 +819,7 @@ var rcloneRefresh = func(path, name string) error {
 		}
 	}
 	if e != nil {
-		return errors.New("未找到 rclone，请先安装：brew install rclone")
+		return errors.New("未找到 rclone，请先安装 rclone（macOS: brew install rclone；Linux: apt/yum install rclone）")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -786,10 +847,7 @@ func rcloneAccess(path string) (string, error) {
 	return access, nil
 }
 
-// UseEasyColabDrive reuses EasyColab's rclone Drive grant: rclone's own client
-// already has Drive API enabled, so no Cloud project is needed.
-func (s *Studio) UseEasyColabDrive() error {
-	path := rcloneDriveConf()
+func (s *Studio) useRcloneDrivePath(path string) error {
 	token, e := rcloneAccess(path)
 	if e != nil {
 		return e
@@ -818,4 +876,48 @@ func (s *Studio) UseEasyColabDrive() error {
 	s.driveMessage = "已使用 EasyColab 的 Drive 授权（drive.file，仅访问本应用创建的文件）"
 	s.driveMu.Unlock()
 	return nil
+}
+
+func (s *Studio) importRcloneDriveBytes(b []byte) error {
+	if _, _, _, e := parseRcloneDriveConf(b); e != nil {
+		return e
+	}
+	dir := dataDir()
+	if e := os.MkdirAll(dir, 0o700); e != nil {
+		return e
+	}
+	tmp, e := os.CreateTemp(dir, ".drive_rclone.*.conf")
+	if e != nil {
+		return e
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if e = tmp.Chmod(0o600); e != nil {
+		_ = tmp.Close()
+		return e
+	}
+	if _, e = tmp.Write(b); e != nil {
+		_ = tmp.Close()
+		return e
+	}
+	if e = tmp.Close(); e != nil {
+		return e
+	}
+	target := filepath.Join(dir, "drive_rclone.conf")
+	if e = os.Rename(tmpName, target); e != nil {
+		return e
+	}
+	cleanup = false
+	return s.useRcloneDrivePath(target)
+}
+
+// UseEasyColabDrive reuses EasyColab's rclone Drive grant: rclone's own client
+// already has Drive API enabled, so no Cloud project is needed.
+func (s *Studio) UseEasyColabDrive() error {
+	return s.useRcloneDrivePath(rcloneDriveConf())
 }

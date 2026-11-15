@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/egoist/mygo"
 )
 
 type existingCredential struct {
@@ -64,11 +62,57 @@ func readExistingCredential() (existingCredential, error) {
 	if !os.IsNotExist(e) {
 		return existingCredential{}, errors.New("无法访问 EasyColab 登录文件，请检查文件权限")
 	}
-	b, e := mygo.Secrets.Service("google-colab-cli").Get("oauth_token")
+	b, e := readSystemColabCLISecret()
 	if e != nil {
 		return existingCredential{}, errors.New("未找到可读取的 EasyColab / Colab CLI 登录，请使用浏览器授权")
 	}
 	return parseExistingCredential(b)
+}
+
+func (s *Studio) applyExistingCredentialLocked(c existingCredential) error {
+	t, e := exchange(url.Values{"client_id": {c.ClientID}, "client_secret": {c.ClientSecret}, "refresh_token": {c.Refresh}, "grant_type": {"refresh_token"}})
+	if e != nil {
+		return errors.New("已有登录无法刷新：可能已撤销、过期或网络不可用。请检查网络，或使用浏览器重新授权")
+	}
+	if t.Refresh == "" {
+		t.Refresh = c.Refresh
+	}
+	cfg := Config{ClientID: c.ClientID, Remote: strings.HasPrefix(c.ClientID, "764086051850-")}
+	if e = store.Set("client-secret", []byte(c.ClientSecret)); e != nil {
+		return errors.New("无法将已有客户端配置写入加密密钥库")
+	}
+	p := configPath()
+	if e = os.MkdirAll(filepath.Dir(p), 0700); e != nil {
+		return errors.New("无法创建本机配置目录")
+	}
+	b, _ := json.Marshal(cfg)
+	if e = os.WriteFile(p, b, 0600); e != nil {
+		return errors.New("无法保存本机配置")
+	}
+	if e = saveToken(t); e != nil {
+		return e
+	}
+	s.compatible = false
+	s.verifier = ""
+	s.loginRedirect = ""
+	s.loginState = ""
+	s.remoteConfig = Config{}
+	return nil
+}
+
+func (s *Studio) importExistingCredentialBytes(b []byte) error {
+	c, e := parseExistingCredential(b)
+	if e != nil {
+		return e
+	}
+	unlock, guardErr := s.lockAccountChange()
+	if guardErr != nil {
+		return guardErr
+	}
+	defer unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyExistingCredentialLocked(c)
 }
 
 // ReuseExistingLogin validates the refresh grant before local persistence.
@@ -85,30 +129,5 @@ func (s *Studio) ReuseExistingLogin() error {
 	if e != nil {
 		return e
 	}
-	t, e := exchange(url.Values{"client_id": {c.ClientID}, "client_secret": {c.ClientSecret}, "refresh_token": {c.Refresh}, "grant_type": {"refresh_token"}})
-	if e != nil {
-		return errors.New("已有登录无法刷新：可能已撤销、过期或网络不可用。请检查网络，或使用浏览器重新授权")
-	}
-	if t.Refresh == "" {
-		t.Refresh = c.Refresh
-	}
-	cfg := Config{ClientID: c.ClientID, Remote: strings.HasPrefix(c.ClientID, "764086051850-")}
-	if e = store.Set("client-secret", []byte(c.ClientSecret)); e != nil {
-		return errors.New("无法将已有客户端配置写入 Keychain")
-	}
-	p := configPath()
-	if e = os.MkdirAll(filepath.Dir(p), 0700); e != nil {
-		return errors.New("无法创建本机配置目录")
-	}
-	b, _ := json.Marshal(cfg)
-	if e = os.WriteFile(p, b, 0600); e != nil {
-		return errors.New("无法保存本机配置")
-	}
-	if e = saveToken(t); e != nil {
-		return e
-	}
-	s.compatible = false
-	s.verifier = ""
-	s.remoteConfig = Config{}
-	return nil
+	return s.applyExistingCredentialLocked(c)
 }

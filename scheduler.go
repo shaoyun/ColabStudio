@@ -236,8 +236,71 @@ func (s *Studio) StopToybox(confirmed bool) error {
 	if e := m.put(r); e != nil {
 		return e
 	}
-	return m.command(r, "drain", random())
+	if e := m.command(r, "drain", random()); e != nil {
+		return e
+	}
+	go s.nudgeStopProgress()
+	return nil
 }
+
+func (s *Studio) nudgeStopProgress() {
+	for _, wait := range []time.Duration{2 * time.Second, 4 * time.Second} {
+		time.Sleep(wait)
+		m := s.svc
+		if m == nil {
+			return
+		}
+		r := m.get()
+		if r.Runtime == "" || !r.StopRequested {
+			return
+		}
+		_ = s.RefreshService()
+	}
+}
+
+func (s *Studio) forceReleaseToybox() error {
+	m := s.services()
+	if m.err != nil {
+		return m.err
+	}
+	if !m.op.TryLock() {
+		return errors.New("服务操作正在进行，请稍后重试")
+	}
+	defer m.op.Unlock()
+	r := m.get()
+	if r.Runtime == "" {
+		return errors.New("没有已确认的服务实例可释放")
+	}
+	if _, e := m.identity(r); e != nil {
+		return e
+	}
+	r.StopRequested = true
+	if key, active, _ := ruleWindow(r.Rule, time.Now()); active {
+		r.Suppressed = key
+	}
+	r.State = "releasing"
+	r.Message = "正在强制释放实例（未执行 Drive 备份）"
+	if e := m.put(r); e != nil {
+		return e
+	}
+	if e := s.Release(r.Runtime, true); e != nil {
+		return m.fail(r, e)
+	}
+	r.Runtime = ""
+	r.RunningWindow = ""
+	r.Operation = ""
+	r.PostSent = false
+	r.StopRequested = false
+	r.BackupNonce = ""
+	r.RemoteRoot = ""
+	r.RemoteVersion = ""
+	r.RemoteOutdated = false
+	r.URL = ""
+	r.State = "stopped"
+	r.Message = "已强制释放实例（未执行 Drive 备份）"
+	return m.put(r)
+}
+
 func (s *Studio) RefreshService() error {
 	m := s.services()
 	if m.err != nil {
@@ -263,28 +326,33 @@ func (s *Studio) RefreshService() error {
 	}
 	return m.put(r)
 }
-func (s *Studio) OpenToybox() error {
+
+func (s *Studio) openToyboxURL() (string, error) {
 	m := s.services()
 	r := m.get()
 	if _, e := m.identity(r); e != nil {
-		return e
+		return "", e
 	}
 	security, e := s.ToyboxAccessStatus()
 	if e != nil {
-		return e
+		return "", e
 	}
 	if !security.Protected {
-		return errors.New("请先启用网页鉴权，或等待网页进程确认后再打开")
+		return "", errors.New("请先启用网页鉴权，或等待网页进程确认后再打开")
 	}
 	state, e := m.state(r)
 	if e != nil {
-		return e
+		return "", e
 	}
 	readiness := readinessFromState(state, time.Now(), r.TunnelURL)
 	if !readiness.Fresh || !readiness.Health || state.Stage != "online" {
-		return errors.New("服务尚未确认就绪，请查看服务状态后再打开网页")
+		return "", errors.New("服务尚未确认就绪，请查看服务状态后再打开网页")
 	}
-	u, e := urlForToyboxWithCustom(state.URL, r.TunnelURL)
+	return urlForToyboxWithCustom(state.URL, r.TunnelURL)
+}
+
+func (s *Studio) OpenToybox() error {
+	u, e := s.openToyboxURL()
 	if e != nil {
 		return e
 	}

@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"github.com/egoist/mygo"
 )
 
 type keyStore interface {
@@ -87,19 +85,32 @@ func (v *credentialVault) Get(name string) ([]byte, error) {
 	}
 	value, ok := v.values[name]
 	if !ok {
-		return nil, mygo.ErrSecretNotFound
+		return nil, errSecretNotFound
 	}
 	return append([]byte(nil), value...), nil
 }
 func (v *credentialVault) save(values map[string][]byte) error {
 	if len(v.key) == 0 {
-		key := make([]byte, 32)
-		if _, e := rand.Read(key); e != nil {
-			return errors.New("无法生成本机登录密钥")
+		var key []byte
+		if preset, ok := v.backend.(presetKeyStore); ok {
+			pk, pe := preset.PresetKey()
+			if pe != nil && !errors.Is(pe, errSecretNotFound) {
+				v.loadErr = pe
+				return v.loadErr
+			}
+			if len(pk) == 32 {
+				key = pk
+			}
 		}
-		if e := v.backend.Set(vaultKeyName, key); e != nil {
-			v.loadErr = errors.New("无法保存登录密钥，本次不再重复请求钥匙串；重新打开应用后可重试")
-			return v.loadErr
+		if len(key) == 0 {
+			key = make([]byte, 32)
+			if _, e := rand.Read(key); e != nil {
+				return errors.New("无法生成本机登录密钥")
+			}
+			if e := v.backend.Set(vaultKeyName, key); e != nil {
+				v.loadErr = errors.New("无法保存登录密钥，本次不再重复请求钥匙串；重新打开应用后可重试")
+				return v.loadErr
+			}
 		}
 		v.key = key
 	}

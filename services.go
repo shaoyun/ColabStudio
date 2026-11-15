@@ -14,8 +14,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/egoist/mygo"
 )
 
 type ServiceRule struct {
@@ -125,7 +123,7 @@ func (m *serviceManager) enablePowerHooks() {
 		return
 	}
 	m.ka.setWakeProvider(func(reason string) func() {
-		return mygo.Power.KeepAwake(reason, false)
+		return platformKeepAwake(reason)
 	})
 	m.ka.notify()
 }

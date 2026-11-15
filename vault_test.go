@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/egoist/mygo"
 )
 
 type countingKeyStore struct {
@@ -76,7 +74,7 @@ func TestVaultOneKeychainOperationPerProcess(t *testing.T) {
 	if e := restarted.Delete("refresh-token"); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := restarted.Get("refresh-token"); !errors.Is(e, mygo.ErrSecretNotFound) {
+	if _, e := restarted.Get("refresh-token"); !errors.Is(e, errSecretNotFound) {
 		t.Fatal("logout did not remove credential")
 	}
 	if backend.reads != 1 || backend.writes != 1 {

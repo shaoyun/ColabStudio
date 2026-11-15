@@ -1,0 +1,30 @@
+[Unit]
+Description=ColabStudio Headless Web & Toybox Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=colabstudio
+Group=colabstudio
+StateDirectory=colabstudio
+StateDirectoryMode=0700
+Environment="COLABSTUDIO_LISTEN=127.0.0.1:8787"
+Environment="COLABSTUDIO_DATA_DIR=/var/lib/colabstudio"
+# 可选：手动指定主密钥（32 字节密钥的 64 位十六进制或 Base64）；不设置时自动生成 vault.key (0600)
+# Environment="COLABSTUDIO_VAULT_KEY="
+# 可选：固定访问控制面板与 REST API 的 Bearer Token；不设置时自动生成 api.token (0600)
+# Environment="COLABSTUDIO_API_TOKEN="
+ExecStart=/usr/local/bin/colabstudio-server
+Restart=on-failure
+RestartSec=5s
+
+# systemd 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/colabstudio
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/egoist/mygo"
 	"io"
 	"net/http"
 	"net/url"
@@ -104,20 +103,27 @@ func fetchAssignments(client *http.Client, base, token string) ([]Runtime, error
 	}
 	return rows, nil
 }
-func (s *Studio) compatibleOpen(name string) error {
+func (s *Studio) compatibleURL(name string) (string, error) {
 	if _, e := decodeEndpoint(name); e != nil {
-		return e
+		return "", e
 	}
 	rows, e := s.compatibleList()
 	if e != nil {
-		return e
+		return "", e
 	}
 	for _, r := range rows {
 		if r.Name == name {
-			return openRuntimeURL(r.ConnectionInfo.URL)
+			return validateRuntimeURL(r.ConnectionInfo.URL)
 		}
 	}
-	return errors.New("实例已不存在，请刷新")
+	return "", errors.New("实例已不存在，请刷新")
+}
+func (s *Studio) compatibleOpen(name string) error {
+	u, e := s.compatibleURL(name)
+	if e != nil {
+		return e
+	}
+	return platformOpenExternal(u)
 }
 func (s *Studio) compatibleRelease(name string) error {
 	endpoint, e := decodeEndpoint(name)
@@ -167,5 +173,5 @@ func fetchRuntimes(client *http.Client, base, tunnel, token string) ([]Runtime, 
 	return data.Runtimes, false, e
 }
 func (s *Studio) OpenColab() error {
-	return mygo.Shell.OpenExternal("https://colab.research.google.com/")
+	return platformOpenExternal("https://colab.research.google.com/")
 }

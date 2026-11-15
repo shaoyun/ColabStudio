@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/egoist/mygo"
 	"strings"
 	"time"
 )
@@ -58,7 +57,7 @@ func storedSecret(id, prefix, readErr string, generate func() string) (string, e
 	if e == nil && len(b) > 0 {
 		return string(b), nil
 	}
-	if e != nil && !errors.Is(e, mygo.ErrSecretNotFound) {
+	if e != nil && !errors.Is(e, errSecretNotFound) {
 		return "", errors.New(readErr)
 	}
 	value := generate()
@@ -146,7 +145,7 @@ func (s *Studio) CopyToyboxPassword() error {
 	if e != nil {
 		return e
 	}
-	mygo.Clipboard.WriteText(p)
+	platformWriteClipboard(p)
 	return nil
 }
 
@@ -161,22 +160,30 @@ func (s *Studio) CopyToyboxAPIToken() error {
 	if e != nil {
 		return e
 	}
-	mygo.Clipboard.WriteText(t)
+	platformWriteClipboard(t)
 	return nil
 }
 
-// CopyToyboxAPIBaseURL copies the validated OpenAI-compatible /v1 base URL to the system clipboard.
-func (s *Studio) CopyToyboxAPIBaseURL() error {
+func (s *Studio) toyboxAPIBaseURL() (string, error) {
 	m := s.services()
 	if m.err != nil {
-		return m.err
+		return "", m.err
 	}
 	r := m.get()
 	base := apiBaseURL(r)
 	if base == "" {
-		return errors.New("服务尚无已确认的安全访问地址")
+		return "", errors.New("服务尚无已确认的安全访问地址")
 	}
-	mygo.Clipboard.WriteText(base)
+	return base, nil
+}
+
+// CopyToyboxAPIBaseURL copies the validated OpenAI-compatible /v1 base URL to the system clipboard.
+func (s *Studio) CopyToyboxAPIBaseURL() error {
+	base, e := s.toyboxAPIBaseURL()
+	if e != nil {
+		return e
+	}
+	platformWriteClipboard(base)
 	return nil
 }
 
