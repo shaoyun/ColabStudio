@@ -1,0 +1,7 @@
+{
+  "name": "ColabStudio",
+  "identifier": "dev.colabstudio.desktop",
+  "version": "0.1.0",
+  "out": "build",
+  "icon": "resources/icon.png"
+}
