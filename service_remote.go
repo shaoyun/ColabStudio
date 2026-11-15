@@ -171,7 +171,16 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 		return m.fail(*r, errors.New("远端服务标记不匹配，未覆盖部署"))
 	}
 	cfg, _ := json.Marshal(map[string]string{"id": r.ID, "binding": r.Binding, "email": r.Account, "managed_by": "ColabStudio"})
-	for name, source := range map[string]string{"toybox_zh_cn.py": "templates/toybox_zh_cn.py", "toybox-zh-cn.json": "templates/toybox-zh-cn.json", "supervisor.py": "templates/toybox_supervisor.py", "web_runner.py": "templates/toybox_web_runner.py", "lock.json": "templates/toybox-lock.json", "download.py": "templates/toybox_download.py", "studio_progress.py": "templates/studio_progress.py", "toybox_auth.py": "templates/toybox_auth.py"} {
+	files := map[string]string{
+		"supervisor.py":      "templates/toybox_supervisor.py",
+		"lock.json":          "templates/toybox-lock.json",
+		"download.py":        "templates/toybox_download.py",
+		"studio_progress.py": "templates/studio_progress.py",
+	}
+	for name, source := range webTemplateFiles {
+		files[name] = source
+	}
+	for name, source := range files {
 		b, _ := templates.ReadFile(source)
 		if e = putRemote(p, root, name, b); e != nil {
 			return m.fail(*r, e)
@@ -184,7 +193,11 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	if e != nil {
 		return m.fail(*r, e)
 	}
-	security, e := makeWebAccessConfig(r.ID, password)
+	token, e := apiToken(r.ID)
+	if e != nil {
+		return m.fail(*r, e)
+	}
+	security, e := makeWebAccessConfig(r.ID, password, token)
 	if e != nil {
 		return m.fail(*r, e)
 	}

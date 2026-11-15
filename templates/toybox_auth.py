@@ -1,7 +1,14 @@
-"""Toybox access password and signed sessions. No credentials in URLs or logs."""
+"""Toybox access password and signed sessions, plus isolated OpenAI API token auth."""
 import base64, hashlib, hmac, http.cookies, json, pathlib, re, secrets, threading, time, urllib.parse
 LOGIN='/__colabstudio/login'
 COOKIE='__Host-colabstudio_session'
+OPENAI_CORS_HEADERS={
+    'Access-Control-Allow-Origin':'*',
+    'Access-Control-Allow-Methods':'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers':'Authorization, Content-Type, X-API-Key, x-goog-api-key, OpenAI-Beta',
+    'Access-Control-Expose-Headers':'Content-Disposition',
+    'Access-Control-Max-Age':'86400',
+}
 
 class AccessGuard:
     def __init__(self,root):
@@ -14,15 +21,21 @@ class AccessGuard:
     def load(self):
         with self.mutex:
             c=json.loads((self.root/'web-auth.json').read_text())
-            if not c.get('owner') or not re.fullmatch('[a-f0-9]{32}',c.get('salt','')) or not re.fullmatch('[a-f0-9]{64}',c.get('hash','')) or not re.fullmatch('[a-f0-9]{64}',c.get('session_key','')) or not 100000<=c.get('iterations',0)<=1000000:
+            api_hash=c.get('api_token_hash','')
+            if (not c.get('owner')
+                or not re.fullmatch('[a-f0-9]{32}',c.get('salt',''))
+                or not re.fullmatch('[a-f0-9]{64}',c.get('hash',''))
+                or not re.fullmatch('[a-f0-9]{64}',c.get('session_key',''))
+                or not 100000<=c.get('iterations',0)<=1000000
+                or (api_hash and not re.fullmatch('[a-f0-9]{64}',api_hash))):
                 raise ValueError('Invalid access configuration')
-            changed=self.config is None or self.config['revision']!=c['revision']
+            changed=self.config is None or self.config['revision']!=c['revision'] or self.config.get('api_token_hash','')!=api_hash
             self.config=c
             now=time.time()
             if changed:
                 (self.root/'web-auth.json').chmod(0o600)
             if changed or now-self.last_marker>=3:
-                marker={'owner':c['owner'],'revision':c['revision'],'protected':True,'updated':now}
+                marker={'owner':c['owner'],'revision':c['revision'],'protected':True,'api_protected':bool(api_hash),'updated':now}
                 tmp=self.root/('auth-status.%d.tmp'%threading.get_ident());tmp.write_text(json.dumps(marker));tmp.replace(self.root/'auth-status.json');self.last_marker=now
             return c
     def token(self,c):
@@ -40,6 +53,52 @@ class AccessGuard:
             v=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))
             return v['revision']==c['revision'] and time.time()<v['exp']<=time.time()+8*3600+5
         except Exception:return False
+    def extract_api_token(self,h,allow_query=False):
+        """Extract API token from Bearer / X-API-Key / query, explicitly ignoring Basic auth and Cookies."""
+        auth=(h.headers.get('Authorization') or '').strip()
+        if auth.lower().startswith('bearer '):
+            candidate=auth[7:].strip()
+            if candidate:return candidate
+        for header_name in ('X-API-Key','x-goog-api-key'):
+            val=(h.headers.get(header_name) or '').strip()
+            if val:return val
+        if allow_query:
+            qs=urllib.parse.parse_qs(urllib.parse.urlsplit(h.path).query)
+            for param in ('api_key','token','key'):
+                vals=qs.get(param)
+                if vals and vals[0].strip():return vals[0].strip()
+        return ''
+    def send_openai_error(self,h,status,message,err_type='invalid_request_error',code=None):
+        h.send_response(status)
+        h.send_header('Content-Type','application/json; charset=utf-8')
+        h.send_header('Cache-Control','no-store')
+        h.send_header('X-Content-Type-Options','nosniff')
+        for k,v in OPENAI_CORS_HEADERS.items():h.send_header(k,v)
+        data=json.dumps({'error':{'message':message,'type':err_type,'param':None,'code':code}},ensure_ascii=False).encode('utf-8')
+        h.send_header('Content-Length',str(len(data)))
+        h.end_headers()
+        if h.command!='HEAD':h.wfile.write(data)
+    def check_api(self,h,allow_query=False):
+        try:c=self.load()
+        except Exception:
+            self.send_openai_error(h,503,'Access configuration unavailable','server_error','auth_unavailable')
+            return False,''
+        if h.headers.get('X-Forwarded-Proto','').lower()=='http':
+            self.send_openai_error(h,403,'HTTPS required','invalid_request_error','https_required')
+            return False,''
+        expected=c.get('api_token_hash','')
+        if not expected:
+            self.send_openai_error(h,401,'OpenAI API token is not enabled on this instance; update access settings in Colab Studio.','invalid_request_error','api_token_not_configured')
+            return False,''
+        provided=self.extract_api_token(h,allow_query=allow_query)
+        if not provided or len(provided)>512:
+            self.send_openai_error(h,401,'Invalid API Key','invalid_request_error','invalid_api_key')
+            return False,''
+        actual=hashlib.sha256(provided.encode('utf-8')).hexdigest()
+        if not hmac.compare_digest(actual,expected):
+            self.send_openai_error(h,401,'Invalid API Key','invalid_request_error','invalid_api_key')
+            return False,''
+        return True,provided
     def send(self,h,status,body,html=False,location=None,cookie=None):
         h.send_response(status);h.send_header('Content-Type','text/html; charset=utf-8' if html else 'application/json; charset=utf-8');h.send_header('Cache-Control','no-store');h.send_header('Referrer-Policy','same-origin');h.send_header('X-Content-Type-Options','nosniff');h.send_header('X-Frame-Options','DENY');h.send_header('Strict-Transport-Security','max-age=31536000')
         if html:h.send_header('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")

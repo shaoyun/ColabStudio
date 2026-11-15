@@ -160,12 +160,16 @@ func tailLog(text string, lines int, truncated bool) (string, int, bool) {
 }
 
 var logANSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+var logToyboxToken = regexp.MustCompile(`\bsk-toybox-[A-Za-z0-9_-]+\b`)
 var logAuthorization = regexp.MustCompile(`(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+`)
-var logAssignments = regexp.MustCompile(`(?i)((?:\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_ -]?key|authorization|admin[_-]?password|password|token|colab-runtime-proxy-token)\b|密码|密钥|令牌)["']?\s*[:=：]\s*["']?)[^\s,"'&}]+`)
+var logQuerySecret = regexp.MustCompile(`(?i)([?&](?:api_key|token|key)=)[^&\s"'#]+`)
+var logAssignments = regexp.MustCompile(`(?i)((?:\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|api[_ -]?key|x-api-key|x-goog-api-key|authorization|admin[_-]?password|password|token|colab-runtime-proxy-token)\b|密码|密钥|令牌)["']?\s*[:=：]\s*["']?)[^\s,"'&}]+`)
 
 func redactLog(text string, secrets ...string) string {
 	text = logANSI.ReplaceAllString(text, "")
+	text = logToyboxToken.ReplaceAllString(text, "[凭据已隐藏]")
 	text = logAuthorization.ReplaceAllString(text, "[凭据已隐藏]")
+	text = logQuerySecret.ReplaceAllString(text, "${1}[已隐藏]")
 	text = logAssignments.ReplaceAllString(text, "${1}[已隐藏]")
 	for _, secret := range secrets {
 		if len(secret) >= 8 {

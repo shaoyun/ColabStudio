@@ -93,3 +93,33 @@ func TestLogSanitizationAndTail(t *testing.T) {
 		t.Fatal("incorrect line trimming")
 	}
 }
+
+func TestLogRedactionCoversToyboxAPITokenAndQueryKey(t *testing.T) {
+	rawToken := "sk-toybox-secretTokenValue123456"
+	original := strings.Join([]string{
+		"Authorization: Bearer bearer-secret-999",
+		"X-API-Key: header-api-secret",
+		"x-goog-api-key: goog-api-secret",
+		"GET /v1/images/files/openai_img_1.png?api_key=query-api-key-val HTTP/1.1",
+		"GET /v1/videos/vid_1/content?token=query-token-val HTTP/1.1",
+		"leaked " + rawToken + " inside logs",
+	}, "\n")
+	clean := redactLog(original, rawToken)
+	for _, secret := range []string{
+		rawToken,
+		"bearer-secret-999",
+		"header-api-secret",
+		"goog-api-secret",
+		"query-api-key-val",
+		"query-token-val",
+	} {
+		if strings.Contains(clean, secret) {
+			t.Fatalf("secret %q leaked into redacted log: %s", secret, clean)
+		}
+	}
+	for _, preserved := range []string{"/v1/images/files/openai_img_1.png", "/v1/videos/vid_1/content"} {
+		if !strings.Contains(clean, preserved) {
+			t.Fatalf("expected path %q preserved in redacted log: %s", preserved, clean)
+		}
+	}
+}

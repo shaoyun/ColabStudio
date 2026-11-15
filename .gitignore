@@ -5,3 +5,5 @@ design/
 evidence/
 __pycache__/
 *.pyc
+
+.worktrees/
