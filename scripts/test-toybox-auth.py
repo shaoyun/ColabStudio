@@ -10,9 +10,12 @@ class AccessTests(unittest.TestCase):
   self.write_config();self.guard=AccessGuard(self.root);self.generated=0;outer=self
   class Handler(http.server.BaseHTTPRequestHandler):
    def do_GET(self):
-    if outer.guard.check(self):self.send_response(200);self.end_headers();self.wfile.write(b'PRIVATE TOYBOX CONTENT')
+    if outer.guard.check(self):body=b'PRIVATE TOYBOX CONTENT';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
    def do_POST(self):
-    if outer.guard.check(self):outer.generated+=1;self.send_response(200);self.end_headers();self.wfile.write(b'generated')
+    if outer.guard.check(self):
+     n=int(self.headers.get('Content-Length','0') or 0)
+     if n>0:self.rfile.read(n)
+     outer.generated+=1;body=b'generated';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
    def log_message(self,*args):pass
   self.server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
  def tearDown(self):self.server.shutdown();self.server.server_close();self.thread.join();self.tmp.cleanup()
@@ -95,19 +98,22 @@ class OpenAIIsolatedAuthTests(unittest.TestCase):
   class Handler(http.server.BaseHTTPRequestHandler):
    def do_GET(self):
     if is_inference_path(self.path):return outer.gateway.handle(self)
-    if outer.guard.check(self):outer.web_calls+=1;self.send_response(200);self.end_headers();self.wfile.write(b'WEB_OK')
+    if outer.guard.check(self):outer.web_calls+=1;body=b'WEB_OK';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
    def do_HEAD(self):
     if is_inference_path(self.path):return outer.gateway.handle(self)
-    if outer.guard.check(self):self.send_response(200);self.end_headers()
+    if outer.guard.check(self):self.send_response(200);self.send_header('Content-Length','0');self.end_headers()
    def do_POST(self):
     if is_inference_path(self.path):return outer.gateway.handle(self)
-    if outer.guard.check(self):outer.web_calls+=1;self.send_response(200);self.end_headers();self.wfile.write(b'WEB_POST_OK')
+    if outer.guard.check(self):
+     n=int(self.headers.get('Content-Length','0') or 0)
+     if n>0:self.rfile.read(n)
+     outer.web_calls+=1;body=b'WEB_POST_OK';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
    def do_DELETE(self):
     if is_inference_path(self.path):return outer.gateway.handle(self)
-    if outer.guard.check(self):self.send_response(200);self.end_headers()
+    if outer.guard.check(self):self.send_response(200);self.send_header('Content-Length','0');self.end_headers()
    def do_OPTIONS(self):
     if is_inference_path(self.path):return outer.gateway.handle(self)
-    if outer.guard.check(self):self.send_response(204);self.end_headers()
+    if outer.guard.check(self):self.send_response(204);self.send_header('Content-Length','0');self.end_headers()
    def log_message(self,*args):pass
   self.server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
   self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()

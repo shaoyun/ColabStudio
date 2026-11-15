@@ -20,7 +20,8 @@ import (
 //go:embed templates/*
 var templates embed.FS
 
-const toyboxVersion = "44708d4aa17e30fc8b56be375387ba2106936a9c"
+// toyboxVersion 标识部署来源：fork shaoyun/minimax-h3-colab（基线 44708d4 + 中文化 + UI 调整）。
+const toyboxVersion = "efa7310b54faaf06c4b22a6fd7b18e1c9bfefd69"
 
 type remoteState struct {
 	Owner     string        `json:"owner"`
@@ -53,8 +54,14 @@ func executeOwned(p runtimeProxy, code string) error {
 		return errors.New("部署 kernel 无效")
 	}
 	defer proxyRequest(httpClient, p, "DELETE", "api/kernels/"+k.ID, nil, nil)
+	return runCode(p, k.ID, code, false)
+}
+
+// runCode sends code to a kernel. With untilBusy it returns once execution has
+// started and leaves it running; otherwise it waits for completion.
+func runCode(p runtimeProxy, kernel, code string, untilBusy bool) error {
 	session := random()
-	config, e := diagnosticSocketConfig(p, k.ID, session)
+	config, e := diagnosticSocketConfig(p, kernel, session)
 	if e != nil {
 		return e
 	}
@@ -94,8 +101,11 @@ func executeOwned(p runtimeProxy, code string) error {
 		if reply.Header.Type == "error" || reply.Content.Status == "error" {
 			failed = true
 		}
+		if untilBusy && reply.Header.Type == "status" && reply.Content.State == "busy" {
+			return nil
+		}
 		if reply.Header.Type == "status" && reply.Content.State == "idle" {
-			if failed {
+			if failed || untilBusy {
 				return errors.New("远端部署准备失败，请查看部署日志")
 			}
 			return nil
@@ -103,6 +113,48 @@ func executeOwned(p runtimeProxy, code string) error {
 	}
 	return errors.New("部署准备未完成")
 }
+
+// Colab only applies its idle timeout once code stops executing (Pro+ background
+// execution), so a dedicated kernel runs a sleep loop for as long as the VM lives.
+// Release is unaffected: unassign removes the VM regardless of running cells.
+const keepAliveCode = "import time\nwhile True:\n    time.sleep(30)\n"
+
+var ensureKeepAlive = func(p runtimeProxy, root string) error {
+	var kernels []diagnosticKernel
+	if e := proxyRequest(httpClient, p, "GET", "api/kernels", nil, &kernels); e != nil {
+		return e
+	}
+	var mark struct {
+		ID string `json:"id"`
+	}
+	if remoteJSON(p, root, "keepalive.json", &mark) == nil && kernelID.MatchString(mark.ID) {
+		for _, k := range kernels {
+			if k.ID != mark.ID {
+				continue
+			}
+			if k.State == "busy" {
+				return nil
+			}
+			// Only our own marked kernel is ever removed.
+			_ = proxyRequest(httpClient, p, "DELETE", "api/kernels/"+k.ID, nil, nil)
+		}
+	}
+	var k diagnosticKernel
+	slow := *httpClient
+	slow.Timeout = 3 * time.Minute
+	if e := proxyRequest(&slow, p, "POST", "api/kernels", map[string]string{"name": "python3"}, &k); e != nil {
+		return e
+	}
+	if !kernelID.MatchString(k.ID) {
+		return errors.New("保活 kernel 无效")
+	}
+	b, _ := json.Marshal(map[string]string{"id": k.ID})
+	if e := putRemote(p, root, "keepalive.json", b); e != nil {
+		return e
+	}
+	return runCode(p, k.ID, keepAliveCode, true)
+}
+
 func putRemote(p runtimeProxy, root, name string, data []byte) error {
 	var v any
 	return proxyRequest(httpClient, p, "PUT", "api/contents/"+root+"/"+name, map[string]any{"type": "file", "format": "base64", "content": base64.StdEncoding.EncodeToString(data)}, &v)
@@ -224,6 +276,9 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 		return m.fail(*r, e)
 	}
 	r.State = "installing"
+	if e = ensureKeepAlive(p, root); e != nil {
+		r.StartupLog = boundedStartupLog(r.StartupLog, "云端保活暂未启动，App 在线时会自动重试")
+	}
 	return m.startStep(r, "done", "远端安装进程已提交；等待环境检查、下载与实时日志，尚未确认网页就绪")
 }
 func (m *serviceManager) state(r ServiceRecord) (remoteState, error) {

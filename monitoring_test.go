@@ -54,11 +54,11 @@ func TestCPUOnlyUsesIdleKernel(t *testing.T) {
 	if e != nil || id != "user-kernel" {
 		t.Fatal("idle kernel should be reused")
 	}
-	if _, e = selectIdleKernel([]diagnosticKernel{{ID: "user-kernel", State: "busy"}}); e == nil {
-		t.Fatal("busy kernel must not receive diagnostic code")
+	if id, e = selectIdleKernel([]diagnosticKernel{{ID: "user-kernel", State: "busy"}}); e != nil || id != "" {
+		t.Fatal("busy kernel must not receive diagnostic code; use a temporary kernel")
 	}
-	if _, e = selectIdleKernel([]diagnosticKernel{{ID: "../bad", State: "idle"}}); e == nil {
-		t.Fatal("unsafe kernel name")
+	if id, e = selectIdleKernel([]diagnosticKernel{{ID: "../bad", State: "idle"}}); e != nil || id != "" {
+		t.Fatal("unsafe kernel name must never be used")
 	}
 }
 

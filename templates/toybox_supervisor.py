@@ -155,7 +155,7 @@ def deploy():
             for repo, name in [('T8mars/comfyui-minimax-h3-audio-T8', 'minimax-h3-audio-t8'), ('facok/comfyui-SelfLift', 'comfyui-SelfLift'), ('NikoDemon80/ComfyUI-H3-Motion-Context', 'ComfyUI-H3-Motion-Context')]:
                 clone(repo, COMFY / 'custom_nodes' / name)
             clone('T8mars/comfyui-minimax-h3-prompt-enhancer-T8', ROOT / 'enhancer')
-            clone('dseditor/minimax-h3-colab', APP.parent)
+            clone('shaoyun/minimax-h3-colab', APP.parent)
             PROGRESS.set(phase='dependencies')
             pip = LOCK['pip']
             run([sys.executable, '-m', 'pip', 'install', 'torch==' + pip['torch'], 'torchvision==' + pip['torchvision'], 'torchaudio==' + pip['torchaudio'], '--index-url', 'https://download.pytorch.org/whl/cu130'])

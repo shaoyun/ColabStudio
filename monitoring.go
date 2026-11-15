@@ -308,7 +308,7 @@ func selectIdleKernel(kernels []diagnosticKernel) (string, error) {
 			return k.ID, nil
 		}
 	}
-	return "", errors.New("实例 kernel 正在忙碌或尚未就绪，未提交 CPU 诊断；请空闲后重试")
+	return "", nil
 }
 
 func diagnosticSocketConfig(p runtimeProxy, id, session string) (*websocket.Config, error) {

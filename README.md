@@ -181,7 +181,7 @@ Jupyter 路径根目录差异通过已知的两个文件路径候选处理。此
 
 ### 固定版本与验证边界
 
-上游 Notebook：[H3_Toybox.ipynb](https://github.com/dseditor/minimax-h3-colab/blob/44708d4aa17e30fc8b56be375387ba2106936a9c/H3_Toybox.ipynb)。`templates/toybox-lock.json` 固定 Toybox、ComfyUI 和插件的 Git commits、16 个模型的 HF revision/大小/SHA-256、cloudflared 2026.11.0 及 SHA-256、直接 pip 依赖。PyTorch 使用官方 cu130 索引中相互匹配的 torch 2.11.0 / torchvision 0.26.0 / torchaudio 2.11.0。上游 requirements 的传递依赖未完整锁定，安装冲突会报错，不自动换版本或另申请实例。
+上游 Notebook：[H3_Toybox.ipynb](https://github.com/dseditor/minimax-h3-colab/blob/44708d4aa17e30fc8b56be375387ba2106936a9c/H3_Toybox.ipynb)。Toybox UI 部署来源为 fork [shaoyun/minimax-h3-colab](https://github.com/shaoyun/minimax-h3-colab)（基线 `44708d4` + 中文本地化 + 界面调整，提交记录见 fork）。`templates/toybox-lock.json` 固定 Toybox fork、ComfyUI 和插件的 Git commits、16 个模型的 HF revision/大小/SHA-256、cloudflared 2026.11.0 及 SHA-256、直接 pip 依赖。PyTorch 使用官方 cu130 索引中相互匹配的 torch 2.11.0 / torchvision 0.26.0 / torchaudio 2.11.0。上游 requirements 的传递依赖未完整锁定，安装冲突会报错，不自动换版本或另申请实例。
 
 远端安装和监督脚本在 `templates/`，仅在 Colab 执行；本机应用仍只需 Go/MyGo。模板预检 GPU capability >=8.0、驱动 >=580、空闲磁盘 >=72 GiB；默认申请 L4，按用户所选类型提交，不自动改型。HF 匿名下载，遇限流在部署日志报错；当前未提供 HF token 设置。
 

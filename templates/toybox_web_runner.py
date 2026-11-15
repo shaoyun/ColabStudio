@@ -1,9 +1,7 @@
-"""Load pinned Toybox without forking its UI; add shutdown gating and isolated OpenAI API auth."""
+"""Load pinned Toybox UI from our fork (zh-cn localization baked in); add shutdown gating and isolated OpenAI API auth."""
 import fcntl, importlib.util, pathlib, sys, urllib.parse
 ROOT = pathlib.Path(__file__).resolve().parent
 APP = ROOT / 'minimax-h3-colab' / 'toybox'
-from toybox_zh_cn import localize
-localize(APP)
 sys.path.insert(0, str(APP))
 spec = importlib.util.spec_from_file_location('toybox', APP / 'server.py')
 m = importlib.util.module_from_spec(spec)

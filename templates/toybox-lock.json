@@ -1,13 +1,13 @@
 {
   "version": 1,
-  "toybox": "44708d4aa17e30fc8b56be375387ba2106936a9c",
+  "toybox": "efa7310b54faaf06c4b22a6fd7b18e1c9bfefd69",
   "repos": {
-    "dseditor/minimax-h3-colab": "44708d4aa17e30fc8b56be375387ba2106936a9c",
     "Comfy-Org/ComfyUI": "eee59185ff4f43ae2d9ad122b245619d27d9daad",
     "T8mars/comfyui-minimax-h3-audio-T8": "ee569dab831cf0d14bf8578215c7250874fad2f6",
     "facok/comfyui-SelfLift": "835c3cf7919410f71f414688f049c6ca497789d0",
     "NikoDemon80/ComfyUI-H3-Motion-Context": "518c083d11d80fa5920222ad89889924ee4401c9",
-    "T8mars/comfyui-minimax-h3-prompt-enhancer-T8": "c88de856422ffddaa15c6a55d319ac903a34c065"
+    "T8mars/comfyui-minimax-h3-prompt-enhancer-T8": "c88de856422ffddaa15c6a55d319ac903a34c065",
+    "shaoyun/minimax-h3-colab": "efa7310b54faaf06c4b22a6fd7b18e1c9bfefd69"
   },
   "models": [
     {

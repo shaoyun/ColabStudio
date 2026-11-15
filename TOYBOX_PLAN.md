@@ -10,7 +10,7 @@
 
 ## 已核实的实现依据
 
-- 上游：https://github.com/dseditor/minimax-h3-colab ，本次读取 commit `44708d4aa17e30fc8b56be375387ba2106936a9c`，以其中 H3_Toybox.ipynb 为安装清单依据。部署锁定该 commit，不在每次启动时拉取 main。
+- 上游：https://github.com/dseditor/minimax-h3-colab ，本次读取 commit `44708d4aa17e30fc8b56be375387ba2106936a9c`，以其中 H3_Toybox.ipynb 为安装清单依据。2026-11-15 起 UI 来源改为用户 fork https://github.com/shaoyun/minimax-h3-colab ：fork 在基线 `44708d4` 之上内置中文本地化并承载界面调整，部署锁定 fork commit（见 `templates/toybox-lock.json`），不再运行 localize。
 - ComfyUI 监听 127.0.0.1:8188，Toybox 监听 127.0.0.1:8190。GPU 首选 L4；部署前检查 compute capability、驱动 >=580、磁盘 >=72 GiB。没有 L4 不自动升级到更贵配置，T4 不作为该 int8 模板的后备。
 - 默认包含图片模型与本地改写模型；下载体积和初始化进度在启动前说明。模型、插件和安装依赖通过版本清单固定，不把上游源码复制成一份长期分叉。
 - Notebook 的 Google Drive mount 和 serve_kernel_port_as_window 依赖交互界面，不能直接照搬到无头部署。Google 官方输出工具也注明新窗口端口代理存在浏览器限制。
