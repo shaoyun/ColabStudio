@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/egoist/mygo"
 )
 
 type ServiceRule struct {
@@ -64,6 +66,7 @@ type serviceManager struct {
 	metricsAttempt time.Time
 	metricsRuntime string
 	studio         *Studio
+	ka             *keepAliveManager
 	mu             sync.Mutex
 	op             sync.Mutex
 	record         ServiceRecord
@@ -103,10 +106,30 @@ func (s *Studio) services() *serviceManager {
 				m.err = re
 			}
 		}
+		m.ka = newKeepAliveManager(m)
 		s.svc = m
 		go m.loop()
+		if m.err == nil {
+			go m.ka.loop()
+			m.ka.notify()
+		}
 	})
 	return s.svc
+}
+func (m *serviceManager) enablePowerHooks() {
+	if m == nil || m.ka == nil {
+		return
+	}
+	m.ka.setWakeProvider(func(reason string) func() {
+		return mygo.Power.KeepAwake(reason, false)
+	})
+	m.ka.notify()
+}
+func (m *serviceManager) closeKeepAlive() {
+	if m == nil || m.ka == nil {
+		return
+	}
+	m.ka.close()
 }
 func (m *serviceManager) get() ServiceRecord { m.mu.Lock(); defer m.mu.Unlock(); return m.record }
 func (m *serviceManager) put(r ServiceRecord) error {
@@ -141,6 +164,9 @@ func (m *serviceManager) put(r ServiceRecord) error {
 	m.mu.Lock()
 	m.record = r
 	m.mu.Unlock()
+	if m.ka != nil {
+		m.ka.notify()
+	}
 	return nil
 }
 func (m *serviceManager) fail(r ServiceRecord, e error) error {

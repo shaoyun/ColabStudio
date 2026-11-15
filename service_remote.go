@@ -127,46 +127,7 @@ var runCode = func(p runtimeProxy, kernel, code string, untilBusy bool) error {
 	return errors.New("部署准备未完成")
 }
 
-// Colab only applies its idle timeout once code stops executing (Pro+ background
-// execution), so a dedicated kernel runs a sleep loop for as long as the VM lives.
-// Release is unaffected: unassign removes the VM regardless of running cells.
-const keepAliveCode = "import time\nwhile True:\n    time.sleep(30)\n"
-
-var ensureKeepAlive = func(p runtimeProxy, root string) error {
-	var kernels []diagnosticKernel
-	if e := proxyRequest(httpClient, p, "GET", "api/kernels", nil, &kernels); e != nil {
-		return e
-	}
-	var mark struct {
-		ID string `json:"id"`
-	}
-	if remoteJSON(p, root, "keepalive.json", &mark) == nil && kernelID.MatchString(mark.ID) {
-		for _, k := range kernels {
-			if k.ID != mark.ID {
-				continue
-			}
-			if k.State == "busy" {
-				return nil
-			}
-			// Only our own marked kernel is ever removed.
-			_ = proxyRequest(httpClient, p, "DELETE", "api/kernels/"+k.ID, nil, nil)
-		}
-	}
-	var k diagnosticKernel
-	slow := *httpClient
-	slow.Timeout = 3 * time.Minute
-	if e := proxyRequest(&slow, p, "POST", "api/kernels", map[string]string{"name": "python3"}, &k); e != nil {
-		return e
-	}
-	if !kernelID.MatchString(k.ID) {
-		return errors.New("保活 kernel 无效")
-	}
-	b, _ := json.Marshal(map[string]string{"id": k.ID})
-	if e := putRemote(p, root, "keepalive.json", b); e != nil {
-		return e
-	}
-	return runCode(p, k.ID, keepAliveCode, true)
-}
+// Keep-alive management now lives in keepalive.go (persistent runtime proxy WebSocket + tunnel heartbeat).
 
 func putRemote(p runtimeProxy, root, name string, data []byte) error {
 	var v any
@@ -446,8 +407,14 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	}
 	r.State = "installing"
 	r.RemoteVersion = ""
+	if m.ka != nil {
+		m.ka.syncRoot(p, r.Runtime, root)
+	}
 	if e = ensureKeepAlive(p, root); e != nil {
 		r.StartupLog = boundedStartupLog(r.StartupLog, "云端保活暂未启动，App 在线时会自动重试")
+	}
+	if m.ka != nil {
+		m.ka.notify()
 	}
 	doneMsg := "远端安装进程已提交；等待环境检查、下载与实时日志，尚未确认网页就绪"
 	if hasData || priorExists {
@@ -789,12 +756,16 @@ func (m *serviceManager) keepAlive(r ServiceRecord) error {
 	if e != nil {
 		return e
 	}
-	req, e := http.NewRequest("GET", tunnelBase+url.PathEscape(endpoint)+"/keep-alive/?authuser=0", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, e := http.NewRequestWithContext(ctx, "GET", tunnelBase+url.PathEscape(endpoint)+"/keep-alive/?authuser=0", nil)
 	if e != nil {
 		return e
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Colab-Tunnel", "Google")
+	req.Header.Set("X-Colab-Client-Agent", "colab-cli")
+	req.Header.Set("Accept", "application/json")
 	client := *httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, e := client.Do(req)

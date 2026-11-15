@@ -18,7 +18,14 @@ func main() {
 	mygo.App.WhenReady(func() {
 		w := mygo.NewWindow(mygo.WindowOptions{Title: "Colab Studio", Width: 1120, Height: 780, TitleBarStyle: mygo.TitleBarHiddenInset})
 		setupTray(w)
-		activeStudio.services()
+		svc := activeStudio.services()
+		svc.enablePowerHooks()
+		mygo.Power.OnResume(func() {
+			if svc.ka != nil {
+				svc.ka.forceReconnect()
+			}
+			go func() { _ = activeStudio.RefreshService() }()
+		})
 		startSmoke(w)
 		p, _ := assets.ReadFile("web/index.html")
 		css, _ := assets.ReadFile("web/style.css")

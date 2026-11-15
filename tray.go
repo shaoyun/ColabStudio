@@ -32,5 +32,10 @@ func setupTray(w *mygo.Window) {
 		}
 	})
 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) { quitting = true })
-	mygo.App.OnWillQuit(func(*mygo.QuitEvent) { tray.Destroy() })
+	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
+		if activeStudio.svc != nil {
+			activeStudio.svc.closeKeepAlive()
+		}
+		tray.Destroy()
+	})
 }

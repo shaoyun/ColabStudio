@@ -163,22 +163,22 @@ func (m *serviceManager) tick(now, previous time.Time) {
 			_ = m.put(r)
 			return
 		}
-		if e := m.keepAlive(r); e != nil {
-			r.State = "disconnected"
-			r.Message = e.Error()
-			_ = m.put(r)
-			return
-		}
+		_ = m.keepAlive(r)
 		if e := m.inspect(&r); e != nil {
 			r.State = "disconnected"
 			r.Message = e.Error()
 			_ = m.put(r)
 			return
 		}
-		if r.RemoteRoot != "" && !r.StopRequested {
-			// Repairs the cloud keep-alive if its kernel died; retried next tick on failure.
-			if p, e := m.studio.proxy(r.Runtime); e == nil {
-				_ = ensureKeepAlive(p, r.RemoteRoot)
+		if !r.StopRequested {
+			if m.ka != nil {
+				m.ka.notify()
+			}
+			if r.RemoteRoot != "" {
+				// Repairs the cloud keep-alive if its kernel died; retried next tick on failure.
+				if p, e := m.studio.proxy(r.Runtime); e == nil {
+					_ = ensureKeepAlive(p, r.RemoteRoot)
+				}
 			}
 		}
 		if active && r.Rule.Enabled && r.RunningWindow == "" {
