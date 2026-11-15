@@ -87,6 +87,35 @@ def clone(repo, dest):
     run(['git', '-C', str(dest), 'fetch', '--depth', '1', 'origin', LOCK['repos'][repo]])
     run(['git', '-C', str(dest), 'checkout', '--detach', LOCK['repos'][repo]])
 
+def repo_matches(dest, commit):
+    dest = pathlib.Path(dest)
+    if not (dest / '.git').is_dir():
+        return False
+    try:
+        head = subprocess.check_output(['git', '-C', str(dest), 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL, text=True).strip()
+        return head == commit
+    except Exception:
+        return False
+
+def stop_proc(name):
+    proc = PROCS.pop(name, None)
+    if not proc or proc.poll() is not None:
+        persist_processes()
+        return
+    proc.terminate()
+    for _ in range(20):
+        if proc.poll() is not None:
+            persist_processes()
+            return
+        time.sleep(0.5)
+    try:
+        import signal
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    persist_processes()
+
 def spawn(name, args, cwd=None, env=None):
     old = PROCS.get(name)
     if old and old.poll() is None:
@@ -147,7 +176,17 @@ def deploy():
             time.sleep(2)
         # Probe in a child so installing a new torch does not leave stale modules loaded.
         check = "import torch,shutil,subprocess; assert torch.cuda.is_available(),'GPU missing'; assert torch.cuda.get_device_capability(0)>=(8,0),'Unsupported GPU'; assert int(subprocess.check_output(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader']).decode().split('.')[0])>=580,'Driver needs 580+'; assert shutil.disk_usage('/content').free>=72*2**30,'Need 72 GiB free'"
-        if not (ROOT / 'installed.json').exists():
+        installed_file = ROOT / 'installed.json'
+        already_installed = installed_file.exists()
+        installed_version = ''
+        if already_installed:
+            try:
+                installed_version = json.loads(installed_file.read_text()).get('version', '')
+            except Exception:
+                installed_version = ''
+        comfy_changed = False
+        tunnel_changed = False
+        if not already_installed:
             run([sys.executable, '-c', check])
             PROGRESS.set(phase='repositories')
             update(message='Installing pinned ComfyUI and extensions')
@@ -173,7 +212,37 @@ def deploy():
             if not LOCK['cloudflared'].get('sha256') or digest(cf) != LOCK['cloudflared']['sha256']:
                 raise RuntimeError('cloudflared checksum mismatch')
             cf.chmod(0o700)
-            atomic(ROOT / 'installed.json', {'version': LOCK['toybox']})
+            atomic(installed_file, {'version': LOCK['toybox']})
+        else:
+            for repo, dest in [
+                ('Comfy-Org/ComfyUI', COMFY),
+                ('T8mars/comfyui-minimax-h3-audio-T8', COMFY / 'custom_nodes' / 'minimax-h3-audio-t8'),
+                ('facok/comfyui-SelfLift', COMFY / 'custom_nodes' / 'comfyui-SelfLift'),
+                ('NikoDemon80/ComfyUI-H3-Motion-Context', COMFY / 'custom_nodes' / 'ComfyUI-H3-Motion-Context'),
+            ]:
+                if not repo_matches(dest, LOCK['repos'][repo]):
+                    PROGRESS.set(phase='repositories')
+                    update(stage='installing', message='Updating pinned repositories')
+                    clone(repo, dest)
+                    comfy_changed = True
+            for repo, dest in [
+                ('T8mars/comfyui-minimax-h3-prompt-enhancer-T8', ROOT / 'enhancer'),
+                ('shaoyun/minimax-h3-colab', APP.parent),
+            ]:
+                if not repo_matches(dest, LOCK['repos'][repo]):
+                    PROGRESS.set(phase='repositories')
+                    update(stage='installing', message='Updating Toybox to pinned version')
+                    clone(repo, dest)
+            cf = ROOT / 'cloudflared'
+            if not cf.exists() or not LOCK['cloudflared'].get('sha256') or digest(cf) != LOCK['cloudflared']['sha256']:
+                PROGRESS.set(phase='tunnel_setup')
+                urllib.request.urlretrieve(LOCK['cloudflared']['url'], cf)
+                if not LOCK['cloudflared'].get('sha256') or digest(cf) != LOCK['cloudflared']['sha256']:
+                    raise RuntimeError('cloudflared checksum mismatch')
+                cf.chmod(0o700)
+                tunnel_changed = True
+            if installed_version != LOCK['toybox']:
+                atomic(installed_file, {'version': LOCK['toybox']})
         PROGRESS.set(phase='restoring')
         restore()
         (DATA / 'output' / 'H3Toybox').mkdir(parents=True, exist_ok=True)
@@ -186,11 +255,17 @@ def deploy():
         atomic(cfg_path, cfg)
         PROGRESS.set(phase='starting_engine')
         update(stage='starting', message='Starting ComfyUI')
+        if comfy_changed:
+            stop_proc('comfyui')
         spawn('comfyui', [sys.executable, 'main.py', '--listen', '127.0.0.1', '--port', '8188', '--output-directory', str(DATA / 'output')], cwd=COMFY)
         wait_http('http://127.0.0.1:8188/system_stats')
         PROGRESS.set(phase='starting_web')
+        if already_installed:
+            stop_proc('toybox')
         spawn('toybox', [sys.executable, str(ROOT / 'web_runner.py')], cwd=APP, env=dict(os.environ, H3TOYBOX_PORT='8190', H3TOYBOX_DATA=str(DATA), H3TOYBOX_SECRETS=str(ROOT / 'secrets.json')))
         wait_http('http://127.0.0.1:8190/api/config')
+        if tunnel_changed:
+            stop_proc('tunnel')
         spawn('tunnel', [str(ROOT / 'cloudflared'), 'tunnel', '--url', 'http://127.0.0.1:8190'])
         PROGRESS.set(phase='ready')
         update(stage='online', message='Services are ready')
@@ -257,6 +332,13 @@ if __name__ == '__main__':
     threading.Thread(target=deploy, daemon=True).start()
     last_command = ''
     snapshot_nonce = ''
+    stop_requested = False
+    try:
+        initial_cmd = json.loads((ROOT / 'command.json').read_text()) if (ROOT / 'command.json').exists() else {}
+        if initial_cmd.get('action') == 'stop_supervisor':
+            last_command = initial_cmd.get('nonce', '')
+    except Exception:
+        pass
     while True:
         try:
             command_file = ROOT / 'command.json'
@@ -277,7 +359,18 @@ if __name__ == '__main__':
                     (ROOT / 'frozen').unlink(missing_ok=True)
                     snapshot_nonce = ''
                     update(backup=None)
+                elif cmd.get('action') == 'stop_supervisor':
+                    if DEPLOYING:
+                        CANCEL.set()
+                        p = PROCS.get('installer')
+                        if p and p.poll() is None:
+                            p.terminate()
+                        stop_requested = True
+                    else:
+                        sys.exit(0)
             if not DEPLOYING:
+                if stop_requested:
+                    sys.exit(0)
                 if STATE['stage'] == 'failed':
                     # Failed partial installs can contain outputs after restore. Never assume idle.
                     busy = any(p.poll() is None for k,p in PROCS.items() if k in {'comfyui','toybox'})

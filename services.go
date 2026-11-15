@@ -48,6 +48,7 @@ type ServiceRecord struct {
 	Archive       string      `json:"archive"`
 	BackupTime    time.Time   `json:"backupTime"`
 	RemoteRoot    string      `json:"remoteRoot"`
+	RemoteVersion string      `json:"remoteVersion,omitempty"`
 	BackupNonce   string      `json:"backupNonce"`
 }
 type ServiceStatus struct {
@@ -242,6 +243,11 @@ func (m *serviceManager) start(scheduled bool) (err error) {
 	// An allocated VM has no supervisor yet: deployment must precede health checks.
 	if r.RemoteRoot == "" {
 		return m.deploy(&r)
+	}
+	if !scheduled && !r.StopRequested {
+		if v, stateErr := m.state(r); stateErr == nil && v.Version != toyboxVersion {
+			return m.deploy(&r)
+		}
 	}
 	if e = m.inspect(&r); e != nil {
 		return m.fail(r, e)

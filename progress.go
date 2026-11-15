@@ -36,6 +36,8 @@ type RemoteReadiness struct {
 	Fresh     bool    `json:"fresh"`
 	Heartbeat float64 `json:"heartbeat"`
 	URL       string  `json:"url"`
+	Version   string  `json:"version,omitempty"`
+	Outdated  bool    `json:"outdated,omitempty"`
 }
 type ServiceProgress struct {
 	Remote          *RemoteReadiness  `json:"remote,omitempty"`
@@ -119,8 +121,11 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 	if e = remoteJSON(p, r.RemoteRoot, "state.json", &owner); e != nil {
 		return result, e
 	}
-	if owner.Owner != r.ID || owner.Binding != r.Binding || owner.Version != toyboxVersion {
+	if owner.Owner != r.ID || owner.Binding != r.Binding {
 		return result, errors.New("远端服务身份不匹配，未读取进度")
+	}
+	if !validRemoteVersion(owner.Version) {
+		return result, errors.New("远端服务版本标记无效，未读取进度")
 	}
 	result.Remote = readinessFromState(owner, time.Now())
 	var progress TransferProgress
@@ -155,7 +160,7 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 		var installed struct {
 			Version string `json:"version"`
 		}
-		if remoteJSON(p, r.RemoteRoot, "installed.json", &installed) == nil && installed.Version == toyboxVersion {
+		if remoteJSON(p, r.RemoteRoot, "installed.json", &installed) == nil && validRemoteVersion(installed.Version) && installed.Version == owner.Version {
 			result.WeightsReady = true
 			result.WeightsEvidence = "installation"
 		}
@@ -169,6 +174,8 @@ func (s *Studio) DeploymentProgress() (ServiceProgress, error) {
 		result.Message = "部署失败；下方保留最后进度，请查看部署日志"
 	} else if time.Since(time.Unix(int64(owner.Heartbeat), 0)) > 90*time.Second {
 		result.Message = "远端心跳已过期，进度可能不是最新状态"
+	} else if result.Message == "" && owner.Version != toyboxVersion {
+		result.Message = "远端当前运行旧版本 " + shortVersion(owner.Version) + "，进度读取与备份停止均正常可用；任务空闲时可热升级至 " + shortVersion(toyboxVersion)
 	}
 	return result, nil
 }
@@ -178,7 +185,14 @@ func weightsVerified(p TransferProgress) bool {
 }
 func readinessFromState(r remoteState, now time.Time) *RemoteReadiness {
 	age := float64(now.Unix()) - r.Heartbeat
-	out := &RemoteReadiness{Stage: r.Stage, Health: r.Health, Fresh: r.Heartbeat > 0 && age >= -10 && age <= 90, Heartbeat: r.Heartbeat}
+	out := &RemoteReadiness{
+		Stage:     r.Stage,
+		Health:    r.Health,
+		Fresh:     r.Heartbeat > 0 && age >= -10 && age <= 90,
+		Heartbeat: r.Heartbeat,
+		Version:   r.Version,
+		Outdated:  validRemoteVersion(r.Version) && r.Version != toyboxVersion,
+	}
 	if address, e := urlForToybox(r.URL); e == nil {
 		out.URL = address
 	}

@@ -6,6 +6,23 @@ class ProgressReporter:
         self.path = pathlib.Path(root) / 'progress.json'
         self.lock = threading.RLock()
         self.value = {'phase':'preparing','fileIndex':0,'totalFiles':total_files,'totalBytes':total_bytes,'completedBytes':0,'currentBytes':0,'fileBytes':0,'speedBytes':0,'startedAt':time.time()}
+        if total_files == 0 and total_bytes == 0 and self.path.exists():
+            try:
+                existing = json.loads(self.path.read_text(encoding='utf-8'))
+                if isinstance(existing, dict):
+                    valid_int = lambda x: isinstance(x, int) and not isinstance(x, bool) and x >= 0
+                    tf = existing.get('totalFiles')
+                    tb = existing.get('totalBytes')
+                    fi = existing.get('fileIndex', 0)
+                    vf = existing.get('verifiedFiles')
+                    cb = existing.get('completedBytes', 0)
+                    if valid_int(tf) and tf <= 1000 and valid_int(tb) and valid_int(fi) and fi <= tf and valid_int(cb) and cb <= tb:
+                        self.value.update(totalFiles=tf, totalBytes=tb, fileIndex=fi, completedBytes=cb)
+                        if valid_int(vf) and vf <= tf:
+                            self.value['verifiedFiles'] = vf
+                    self.value.update(currentFile='', currentBytes=0, fileBytes=0, speedBytes=0, etaSeconds=None)
+            except Exception:
+                pass
         self.last_write = 0
         self.sample_time = time.monotonic()
         self.sample_bytes = 0

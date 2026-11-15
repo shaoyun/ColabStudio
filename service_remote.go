@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/egoist/mygo"
 	"golang.org/x/net/websocket"
 	"io"
@@ -20,8 +21,20 @@ import (
 //go:embed templates/*
 var templates embed.FS
 
-// toyboxVersion 标识部署来源：fork shaoyun/minimax-h3-colab（基线 44708d4 + 中文化 + UI 调整）。
-const toyboxVersion = "efa7310b54faaf06c4b22a6fd7b18e1c9bfefd69"
+// toyboxVersion 标识部署来源：fork shaoyun/minimax-h3-colab（基线 44708d4 + 中文化 + UI 调整 + 浅色界面与新 Logo）。
+const toyboxVersion = "b7a686836680a77fa604e3469d940d5f63c37391"
+
+var pinnedCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func validRemoteVersion(v string) bool {
+	return pinnedCommitPattern.MatchString(v)
+}
+func shortVersion(v string) string {
+	if len(v) > 7 {
+		return v[:7]
+	}
+	return v
+}
 
 type remoteState struct {
 	Owner     string        `json:"owner"`
@@ -59,7 +72,7 @@ func executeOwned(p runtimeProxy, code string) error {
 
 // runCode sends code to a kernel. With untilBusy it returns once execution has
 // started and leaves it running; otherwise it waits for completion.
-func runCode(p runtimeProxy, kernel, code string, untilBusy bool) error {
+var runCode = func(p runtimeProxy, kernel, code string, untilBusy bool) error {
 	session := random()
 	config, e := diagnosticSocketConfig(p, kernel, session)
 	if e != nil {
@@ -180,6 +193,122 @@ func remoteJSON(p runtimeProxy, root, name string, out any) error {
 	}
 	return nil
 }
+func stopRemoteSupervisor(p runtimeProxy, r ServiceRecord) error {
+	path, _ := json.Marshal("/content/.colabstudio/" + r.ID)
+	owner, _ := json.Marshal(r.ID)
+	binding, _ := json.Marshal(r.Binding)
+	nonce, _ := json.Marshal(random())
+	code := fmt.Sprintf(`import fcntl,json,os,pathlib,signal,time,urllib.error,urllib.request
+def _stop_supervisor():
+    p=pathlib.Path(%s)
+    if not p.exists():
+        return
+    dep=p/'deployment.json'
+    if dep.exists():
+        c=json.loads(dep.read_text())
+        assert c.get('id')==%s and c.get('binding')==%s,'owner mismatch'
+    assert not (p/'draining').exists(),'shutdown in progress'
+    st_file=p/'state.json'
+    if st_file.exists():
+        st=json.loads(st_file.read_text())
+        assert st.get('owner')==%s and st.get('binding')==%s,'state owner mismatch'
+        if st.get('stage')=='online':
+            def get(port,path):
+                with urllib.request.urlopen('http://127.0.0.1:'+str(port)+path,timeout=8) as resp:
+                    return json.load(resp)
+            try:
+                q=get(8188,'/queue')
+                assert isinstance(q.get('queue_running'),list) and isinstance(q.get('queue_pending'),list)
+                assert not q['queue_running'] and not q['queue_pending'],'queue busy'
+            except urllib.error.URLError as e:
+                if not isinstance(getattr(e,'reason',None),ConnectionRefusedError):
+                    raise
+            try:
+                jobs=get(8190,'/api/jobs');agents=get(8190,'/api/agent/runs')
+                assert isinstance(jobs,list) and isinstance(agents,list)
+                assert all(j.get('status') in ('done','error','cancelled','stopped') for j in jobs),'jobs busy'
+                assert all(a.get('status') in ('done','error','cancelled','stopped') for a in agents),'agent busy'
+            except urllib.error.URLError as e:
+                if not isinstance(getattr(e,'reason',None),ConnectionRefusedError):
+                    raise
+    stop_nonce=%s
+    cmd_file=p/'command.json'
+    tmp=cmd_file.with_suffix('.tmp')
+    tmp.write_text(json.dumps({'action':'stop_supervisor','nonce':stop_nonce}),encoding='utf-8')
+    tmp.replace(cmd_file)
+    target=str((p/'supervisor.py').resolve())
+    targets=[]
+    me=os.getpid()
+    proc_root=pathlib.Path('/proc')
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid=int(entry.name)
+            if pid==me:
+                continue
+            try:
+                raw=(entry/'cmdline').read_bytes()
+                if not raw:
+                    continue
+                args=[a.decode('utf-8','replace') for a in raw.split(b'\x00') if a]
+                cwd=os.path.realpath(str(entry/'cwd'))
+                matched=False
+                for arg in args[1:]:
+                    if arg in ('-c','-m'):
+                        break
+                    if arg.startswith('-'):
+                        continue
+                    cand=arg if os.path.isabs(arg) else os.path.join(cwd,arg)
+                    if os.path.realpath(cand)==target:
+                        matched=True
+                    break
+                if matched:
+                    stat=(entry/'stat').read_text().rsplit(')',1)[1].split()
+                    if stat[0]!='Z':
+                        targets.append((pid,(stat[19],raw.hex())))
+            except Exception:
+                continue
+    for pid,_ in targets:
+        try:
+            os.kill(pid,signal.SIGTERM)
+        except OSError:
+            pass
+    with open(p/'supervisor.lock','a') as lf:
+        acquired=False
+        for i in range(20):
+            try:
+                fcntl.flock(lf,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                acquired=True
+                break
+            except BlockingIOError:
+                if i==10:
+                    for pid,sig in targets:
+                        try:
+                            stat=pathlib.Path('/proc/'+str(pid)+'/stat').read_text().rsplit(')',1)[1].split()
+                            raw=pathlib.Path('/proc/'+str(pid)+'/cmdline').read_bytes()
+                            if stat[0]!='Z' and (stat[19],raw.hex())==sig:
+                                os.kill(pid,signal.SIGKILL)
+                        except Exception:
+                            pass
+                time.sleep(0.5)
+        if not acquired:
+            raise RuntimeError('previous supervisor still holds lock')
+        try:
+            if cmd_file.exists():
+                cur=json.loads(cmd_file.read_text())
+                if cur.get('action')=='stop_supervisor' and cur.get('nonce')==stop_nonce:
+                    cmd_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+_stop_supervisor()
+`, string(path), string(owner), string(binding), string(owner), string(binding), string(nonce))
+	if e := executeOwned(p, code); e != nil {
+		return errors.New("无法安全停止旧版监督进程（可能仍有任务运行或正在关闭），已取消升级；未改动原实例")
+	}
+	return nil
+}
+
 func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	defer func() {
 		if err != nil {
@@ -195,32 +324,72 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	}
 	directory := "/content/.colabstudio/" + r.ID
 	quoted, _ := json.Marshal(directory)
-	code := "import pathlib\np=pathlib.Path(" + string(quoted) + ")\np.mkdir(parents=True,exist_ok=True)\n"
-	if e = executeOwned(p, code); e != nil {
-		return m.fail(*r, e)
-	}
-	root := "content/.colabstudio/" + r.ID
+	root := r.RemoteRoot
 	var v any
-	if e = proxyRequest(httpClient, p, "GET", "api/contents/"+root, nil, &v); e != nil {
-		root = ".colabstudio/" + r.ID
-		if e = proxyRequest(httpClient, p, "GET", "api/contents/"+root, nil, &v); e != nil {
+	if root == "" || proxyRequest(httpClient, p, "GET", "api/contents/"+root, nil, &v) != nil {
+		code := "import pathlib\np=pathlib.Path(" + string(quoted) + ")\np.mkdir(parents=True,exist_ok=True)\n"
+		if e = executeOwned(p, code); e != nil {
 			return m.fail(*r, e)
 		}
-	}
-	r.RemoteRoot = root
-	if e = m.put(*r); e != nil {
-		return e
-	}
-	if e = m.startStep(r, "uploading", "上传固定版本的部署脚本与配置"); e != nil {
-		return e
+		root = "content/.colabstudio/" + r.ID
+		if e = proxyRequest(httpClient, p, "GET", "api/contents/"+root, nil, &v); e != nil {
+			root = ".colabstudio/" + r.ID
+			if e = proxyRequest(httpClient, p, "GET", "api/contents/"+root, nil, &v); e != nil {
+				return m.fail(*r, e)
+			}
+		}
+		r.RemoteRoot = root
+		if e = m.put(*r); e != nil {
+			return e
+		}
 	}
 	// A persistent marker is checked before touching files or restarting anything.
 	var prior struct {
 		ID      string `json:"id"`
 		Binding string `json:"binding"`
 	}
-	if e = remoteJSON(p, root, "deployment.json", &prior); e == nil && (prior.ID != r.ID || prior.Binding != r.Binding) {
-		return m.fail(*r, errors.New("远端服务标记不匹配，未覆盖部署"))
+	priorExists := false
+	if e = remoteJSON(p, root, "deployment.json", &prior); e == nil {
+		priorExists = true
+		if prior.ID != r.ID || prior.Binding != r.Binding {
+			return m.fail(*r, errors.New("远端服务标记不匹配，未覆盖部署"))
+		}
+	} else if !strings.Contains(e.Error(), "HTTP 404") {
+		return m.fail(*r, errors.New("远端部署标记读取失败，未覆盖部署"))
+	}
+	if priorExists {
+		var owner remoteState
+		if se := remoteJSON(p, root, "state.json", &owner); se == nil {
+			if owner.Owner != r.ID || owner.Binding != r.Binding {
+				return m.fail(*r, errors.New("远端服务身份不匹配，已暂停自动操作"))
+			}
+			if !validRemoteVersion(owner.Version) {
+				return m.fail(*r, errors.New("远端服务版本标记无效，已暂停自动操作"))
+			}
+			age := time.Since(time.Unix(int64(owner.Heartbeat), 0))
+			if age >= -10*time.Second && age <= 90*time.Second {
+				if r.StopRequested || owner.Stage == "draining" || owner.Stage == "backing_up" || owner.Stage == "backup_ready" {
+					return m.fail(*r, errors.New("服务正在停止或备份中，暂不能热升级"))
+				}
+				if owner.Stage == "installing" {
+					return m.fail(*r, errors.New("远端正在执行安装或下载模型，进度已恢复显示；请等待安装完成后再升级版本"))
+				}
+				if owner.Stage != "failed" && owner.Busy {
+					return m.fail(*r, errors.New("远端仍有运行中的任务或队列未确认空闲，请等待任务完成后再热升级"))
+				}
+			}
+		} else if !strings.Contains(se.Error(), "HTTP 404") {
+			return m.fail(*r, errors.New("远端状态读取失败，暂不替换监督进程"))
+		}
+		if e = m.startStep(r, "replacing", "正在安全停止旧版远端监督进程（保留已加载模型与当前作品）"); e != nil {
+			return e
+		}
+		if e = stopRemoteSupervisor(p, *r); e != nil {
+			return m.fail(*r, e)
+		}
+	}
+	if e = m.startStep(r, "uploading", "上传固定版本的部署脚本与配置"); e != nil {
+		return e
 	}
 	cfg, _ := json.Marshal(map[string]string{"id": r.ID, "binding": r.Binding, "email": r.Account, "managed_by": "ColabStudio"})
 	files := map[string]string{
@@ -271,15 +440,20 @@ func (m *serviceManager) deploy(r *ServiceRecord) (err error) {
 	if e = m.startStep(r, "launching", "部署文件已上传，正在启动远端监督进程"); e != nil {
 		return e
 	}
-	code = "import pathlib,subprocess,sys\np=pathlib.Path(" + string(quoted) + ")\nsubprocess.Popen([sys.executable,'-u',str(p/'supervisor.py')],cwd=p,stdout=open(p/'deployment.log','a'),stderr=subprocess.STDOUT,start_new_session=True)\n"
-	if e = executeOwned(p, code); e != nil {
+	launchCode := "import pathlib,subprocess,sys\np=pathlib.Path(" + string(quoted) + ")\nsubprocess.Popen([sys.executable,'-u',str(p/'supervisor.py')],cwd=p,stdout=open(p/'deployment.log','a'),stderr=subprocess.STDOUT,start_new_session=True)\n"
+	if e = executeOwned(p, launchCode); e != nil {
 		return m.fail(*r, e)
 	}
 	r.State = "installing"
+	r.RemoteVersion = ""
 	if e = ensureKeepAlive(p, root); e != nil {
 		r.StartupLog = boundedStartupLog(r.StartupLog, "云端保活暂未启动，App 在线时会自动重试")
 	}
-	return m.startStep(r, "done", "远端安装进程已提交；等待环境检查、下载与实时日志，尚未确认网页就绪")
+	doneMsg := "远端安装进程已提交；等待环境检查、下载与实时日志，尚未确认网页就绪"
+	if hasData || priorExists {
+		doneMsg = "远端热升级已提交；正在更新固定版本并平滑重启网页进程（保留已下载模型与引擎）"
+	}
+	return m.startStep(r, "done", doneMsg)
 }
 func (m *serviceManager) state(r ServiceRecord) (remoteState, error) {
 	var v remoteState
@@ -293,8 +467,11 @@ func (m *serviceManager) state(r ServiceRecord) (remoteState, error) {
 	if e = remoteJSON(p, r.RemoteRoot, "state.json", &v); e != nil {
 		return v, errors.New("服务状态暂不可读；请核对实例或继续部署，不会重复创建")
 	}
-	if v.Owner != r.ID || v.Binding != r.Binding || v.Version != toyboxVersion {
-		return v, errors.New("远端服务身份或版本不匹配，已暂停自动操作")
+	if v.Owner != r.ID || v.Binding != r.Binding {
+		return v, errors.New("远端服务身份不匹配，已暂停自动操作")
+	}
+	if !validRemoteVersion(v.Version) {
+		return v, errors.New("远端服务版本标记无效，已暂停自动操作")
 	}
 	if time.Since(time.Unix(int64(v.Heartbeat), 0)) > 90*time.Second {
 		return v, errors.New("云端服务心跳超过 90 秒未更新，未确认在线")
@@ -316,10 +493,26 @@ func (m *serviceManager) inspect(r *ServiceRecord) error {
 		return e
 	}
 	r.State = v.Stage
+	r.RemoteVersion = v.Version
 	r.Heartbeat = time.Unix(int64(v.Heartbeat), 0)
 	r.Message = map[string]string{"installing": "正在安装并校验模型，请查看部署日志", "starting": "正在启动服务", "online": "服务在线；网页访问需验证当前账号邮箱", "failed": "部署失败；实例可能仍在计费，请查看日志", "draining": "正在等待任务完成", "backing_up": "正在打包作品", "backup_ready": "正在等待 Drive 保存校验"}[v.Stage]
 	if !v.Health && v.Stage == "online" {
 		r.Message = "服务健康检查异常，暂不释放实例"
+	}
+	if r.StartupError == "远端服务身份或版本不匹配，已暂停自动操作" || (v.Version == toyboxVersion && v.Stage == "online" && v.Health) {
+		r.StartupError = ""
+		if r.StartupPhase == "failed" {
+			r.StartupPhase = "done"
+		}
+	}
+	if v.Version != toyboxVersion {
+		if v.Stage == "online" && v.Health {
+			r.Message = "服务在线（远端运行旧版本 " + shortVersion(v.Version) + "，空闲时可点击热升级更新至 " + shortVersion(toyboxVersion) + "，或直接停止并保存释放）"
+		} else if r.Message != "" {
+			r.Message += "（远端旧版本 " + shortVersion(v.Version) + "）"
+		} else {
+			r.Message = "远端运行旧版本 " + shortVersion(v.Version)
+		}
 	}
 	if v.URL != "" {
 		if _, e = urlForToybox(v.URL); e == nil {
@@ -399,6 +592,7 @@ func (m *serviceManager) finishStop(r *ServiceRecord) error {
 	r.StopRequested = false
 	r.BackupNonce = ""
 	r.RemoteRoot = ""
+	r.RemoteVersion = ""
 	r.URL = ""
 	r.State = "stopped"
 	r.Message = "作品已保存到 Drive，实例已释放"
@@ -448,7 +642,7 @@ func (m *serviceManager) retryDeployment() (err error) {
 	if e = m.startStep(&r, "checking_runtime", "核对远端监督进程，避免重复安装"); e != nil {
 		return e
 	}
-	if _, e = m.state(r); e == nil {
+	if v, e := m.state(r); e == nil && v.Version == toyboxVersion && v.Stage != "failed" {
 		return errors.New("监督进程仍在线，请查看日志；不重复执行安装")
 	}
 	return m.deploy(&r)
@@ -644,6 +838,7 @@ func (m *serviceManager) reconcileGone(r *ServiceRecord) (bool, error) {
 	r.StopRequested = false
 	r.BackupNonce = ""
 	r.RemoteRoot = ""
+	r.RemoteVersion = ""
 	r.URL = ""
 	r.RunningWindow = ""
 	if key, active, _ := ruleWindow(r.Rule, time.Now()); active {
@@ -684,6 +879,7 @@ func (m *serviceManager) releaseUninstalled(r *ServiceRecord) error {
 	r.PostSent = false
 	r.StopRequested = false
 	r.RunningWindow = ""
+	r.RemoteVersion = ""
 	r.State = "stopped"
 	r.Message = "机器已释放，未部署服务"
 	return m.put(*r)
