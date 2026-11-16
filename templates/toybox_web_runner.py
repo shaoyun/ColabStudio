@@ -119,6 +119,51 @@ class QuietThreadingHTTPServer(m.ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+def install_chunk_ffn_fallback():
+    """Keep MiniMaxChunkFeedForward (401) active even when Toybox repo is pinned to an older commit."""
+    if hasattr(m, 'has_chunk_ffn'):
+        return
+    state = {'ok': False}
+
+    def has_chunk_ffn(cfg):
+        if state['ok']:
+            return True
+        try:
+            info = m.comfy(cfg, '/object_info/MiniMaxChunkFeedForward', timeout=5)
+            if 'MiniMaxChunkFeedForward' in (info or {}):
+                state['ok'] = True
+        except Exception:
+            pass
+        return state['ok']
+
+    orig_build_generate = m.build_generate
+    chunk_id = getattr(m, 'N_CHUNK', '401')
+
+    def patched_build_generate(cfg, final_text, chosen, task, req, size, src_job=None):
+        wf, seed = orig_build_generate(cfg, final_text, chosen, task, req, size, src_job)
+        width, height = size
+        if chunk_id not in wf and m.N_SHIFT in wf and min(width, height) >= 1000 and has_chunk_ffn(cfg):
+            wf[chunk_id] = {
+                'class_type': 'MiniMaxChunkFeedForward',
+                'inputs': {
+                    'chunks': 4,
+                    'seq_threshold': 24576,
+                    'model': [m.N_SHIFT, 0],
+                },
+            }
+            for node in wf.values():
+                if node is wf[chunk_id]:
+                    continue
+                for k, v in node.get('inputs', {}).items():
+                    if v == [m.N_SHIFT, 0]:
+                        node['inputs'][k] = [chunk_id, 0]
+        return wf, seed
+
+    m.has_chunk_ffn = has_chunk_ffn
+    m.build_generate = patched_build_generate
+
+
+install_chunk_ffn_fallback()
 m.Handler.send_json = safe_send_json
 m.Handler.log_message = guarded_log_message
 m.Handler.do_GET = guarded_get

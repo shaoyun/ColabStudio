@@ -207,4 +207,118 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(tunnel_proc.terminated)
         self.assertTrue((self.root / 'web.sig').exists())
         self.assertEqual(mod.STATE['stage'], 'online')
+
+    def test_comfy_env_sets_expandable_segments(self):
+        import os
+        orig = os.environ.get('PYTORCH_CUDA_ALLOC_CONF')
+        try:
+            os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
+            self.assertEqual(self.m.comfy_env()['PYTORCH_CUDA_ALLOC_CONF'], 'expandable_segments:True')
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+            self.assertEqual(self.m.comfy_env()['PYTORCH_CUDA_ALLOC_CONF'], 'max_split_size_mb:128,expandable_segments:True')
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collection_threshold:0.8'
+            self.assertEqual(self.m.comfy_env()['PYTORCH_CUDA_ALLOC_CONF'], 'expandable_segments:True,garbage_collection_threshold:0.8')
+        finally:
+            if orig is None:
+                os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
+            else:
+                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = orig
+
+    def test_ensure_chunk_ffn_node_and_math_equivalence(self):
+        import torch
+        import torch.nn as nn
+
+        self.assertFalse(self.m.ensure_chunk_ffn_node())
+        comfy_dir = self.root / 'ComfyUI'
+        comfy_dir.mkdir(parents=True, exist_ok=True)
+        (comfy_dir / 'main.py').write_text('# stub\n', encoding='utf-8')
+        self.assertTrue(self.m.ensure_chunk_ffn_node())
+        node_init = comfy_dir / 'custom_nodes' / 'h3_chunk_ffn' / '__init__.py'
+        self.assertTrue(node_init.is_file())
+        self.assertFalse(self.m.ensure_chunk_ffn_node())
+
+        spec = importlib.util.spec_from_file_location('h3_chunk_ffn_test', node_init)
+        node_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(node_mod)
+        self.assertIn('MiniMaxChunkFeedForward', node_mod.NODE_CLASS_MAPPINGS)
+
+        observed_lens = []
+
+        class ToyMLP(nn.Module):
+            def __init__(self, dim=16, ffn=32):
+                super().__init__()
+                self.fc1 = nn.Linear(dim, ffn * 2, bias=False)
+                self.fc2 = nn.Linear(ffn, dim, bias=False)
+
+            def forward(self, x):
+                observed_lens.append(x.shape[-2])
+                a, b = self.fc1(x).chunk(2, dim=-1)
+                return self.fc2(torch.nn.functional.silu(a) * b)
+
+        class ToyBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = ToyMLP()
+
+        class FakeModelPatcher:
+            def __init__(self, dm):
+                self.diffusion_model = dm
+                self.patches = {}
+
+            def clone(self):
+                return FakeModelPatcher(self.diffusion_model)
+
+            def get_model_object(self, name):
+                assert name == 'diffusion_model'
+                return self.diffusion_model
+
+            def add_object_patch(self, name, obj):
+                self.patches[name] = obj
+
+        dm = nn.Module()
+        dm.blocks = nn.ModuleList([ToyBlock()])
+        patcher = FakeModelPatcher(dm)
+        node = node_mod.NODE_CLASS_MAPPINGS['MiniMaxChunkFeedForward']()
+        (patched,) = node.patch(patcher, chunks=4, seq_threshold=4096)
+        patched_fn = patched.patches['diffusion_model.blocks.0.mlp.forward']
+
+        torch.manual_seed(0)
+        x_long = torch.randn(1, 5000, 16)
+        with torch.no_grad():
+            ref_long = dm.blocks[0].mlp.forward(x_long)
+            observed_lens.clear()
+            got_long = patched_fn(x_long)
+        self.assertTrue(torch.allclose(ref_long, got_long, atol=1e-6))
+        self.assertGreater(len(observed_lens), 1)
+        self.assertTrue(all(n <= 1280 for n in observed_lens))
+
+        x_short = torch.randn(1, 2048, 16)
+        with torch.no_grad():
+            ref_short = dm.blocks[0].mlp.forward(x_short)
+            observed_lens.clear()
+            got_short = patched_fn(x_short)
+        self.assertEqual(observed_lens, [2048])
+        self.assertTrue(torch.equal(ref_short, got_short))
+
+        # High-VRAM GPUs (e.g. A100 40 GiB) bypass chunking cleanly without cloning/patching
+        class Props:
+            def __init__(self, gib):
+                self.total_memory = int(gib * (1024 ** 3))
+
+        orig_avail = torch.cuda.is_available
+        orig_props = torch.cuda.get_device_properties
+        try:
+            torch.cuda.is_available = lambda: True
+            torch.cuda.get_device_properties = lambda idx=0: Props(40.0)
+            (a100_out,) = node.patch(patcher, chunks=4)
+            self.assertIs(a100_out, patcher)
+            self.assertEqual(a100_out.patches, {})
+
+            torch.cuda.get_device_properties = lambda idx=0: Props(22.5)
+            (l4_out,) = node.patch(patcher, chunks=4)
+            self.assertIsNot(l4_out, patcher)
+            self.assertIn('diffusion_model.blocks.0.mlp.forward', l4_out.patches)
+        finally:
+            torch.cuda.is_available = orig_avail
+            torch.cuda.get_device_properties = orig_props
 if __name__=='__main__':unittest.main()

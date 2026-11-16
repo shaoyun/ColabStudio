@@ -20,8 +20,8 @@ import (
 //go:embed templates/*
 var templates embed.FS
 
-// toyboxVersion 标识部署来源：fork shaoyun/minimax-h3-colab（基线 44708d4 + 中文化 + UI 调整 + 浅色界面与新 Logo）。
-const toyboxVersion = "b7a686836680a77fa604e3469d940d5f63c37391"
+// toyboxVersion 标识部署来源：fork shaoyun/minimax-h3-colab（基线 44708d4 + 中文化 + UI 调整 + 浅色界面与新 Logo + 按需无损显存优化）。
+const toyboxVersion = "599f5c626d88101e4ab0ad1c6508e5106943e74c"
 
 var pinnedCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
