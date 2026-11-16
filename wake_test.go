@@ -192,3 +192,164 @@ func TestRetryCannotBypassDriveGate(t *testing.T) {
 		t.Fatalf("retry bypassed Drive: requests=%d message=%s", requests, m.get().Message)
 	}
 }
+
+func TestRejectedAssignDoesNotLockOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		gpu         string
+		postStatus  int
+		postBody    string
+		assignments string
+	}{
+		{
+			name:        "http_200_empty_endpoint",
+			gpu:         "A100",
+			postStatus:  200,
+			postBody:    `{}`,
+			assignments: `{"assignments":[]}`,
+		},
+		{
+			name:        "http_503_capacity_empty",
+			gpu:         "A100",
+			postStatus:  503,
+			postBody:    `unavailable`,
+			assignments: `{"assignments":[]}`,
+		},
+		{
+			name:        "http_412_with_unrelated_browser_vm",
+			gpu:         "H100",
+			postStatus:  412,
+			postBody:    `too many assignments`,
+			assignments: `{"assignments":[{"endpoint":"browser-vm","runtimeProxyInfo":{"url":"https://other.r.colab.dev","token":"other-tok"}}]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := wakeFixture(t, func(r *http.Request) (*http.Response, error) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "assignments"):
+					return wakeResponse(tc.assignments), nil
+				case strings.Contains(r.URL.Path, "api/contents/"):
+					resp := wakeResponse(`{}`)
+					resp.StatusCode = 404
+					return resp, nil
+				case strings.HasSuffix(r.URL.Path, "assign") && r.Method == "GET":
+					return wakeResponse(`{"token":"challenge"}`), nil
+				case strings.HasSuffix(r.URL.Path, "assign") && r.Method == "POST":
+					resp := wakeResponse(tc.postBody)
+					resp.StatusCode = tc.postStatus
+					return resp, nil
+				default:
+					return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+			})
+			if e := m.setMachineType(tc.gpu, true); e != nil {
+				t.Fatal(e)
+			}
+			err := m.wake(false)
+			if err == nil {
+				t.Fatal("expected wake error when allocation rejected")
+			}
+			got := m.get()
+			if got.Operation != "" || got.PostSent || got.State != "stopped" {
+				t.Fatalf("rejected assign leaked pending lock: op=%q postSent=%v state=%q err=%v", got.Operation, got.PostSent, got.State, err)
+			}
+			if e := m.setMachineType("L4", true); e != nil {
+				t.Fatalf("failed to switch machine type after rejected assign: %v", e)
+			}
+		})
+	}
+}
+
+func TestRefreshServiceReconcilesUncertainOperation(t *testing.T) {
+	t.Run("clears_when_cloud_has_no_instances", func(t *testing.T) {
+		m := wakeFixture(t, func(r *http.Request) (*http.Response, error) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "assign"):
+				return wakeResponse(`{"token":"challenge"}`), nil
+			case strings.HasSuffix(r.URL.Path, "assignments"):
+				return wakeResponse(`{"assignments":[]}`), nil
+			default:
+				return nil, fmt.Errorf("unexpected request %s", r.URL.Path)
+			}
+		})
+		m.record = ServiceRecord{
+			ID:           "owned",
+			Account:      "test@example.com",
+			Binding:      accountBinding("test@example.com"),
+			Accelerator:  "A100",
+			Operation:    "stuck-op",
+			PostSent:     true,
+			State:        "uncertain",
+			StartupPhase: "failed",
+			StartupError: "上次申请结果尚未确认，已阻止再次创建；请先核对实例列表",
+		}
+		m.studio.svc = m
+		m.studio.svcOnce.Do(func() {})
+		if e := m.studio.RefreshService(); e != nil {
+			t.Fatal(e)
+		}
+		got := m.get()
+		if got.Operation != "" || got.PostSent || got.State != "stopped" || got.StartupError != "" {
+			t.Fatalf("expected RefreshService to unlock uncertain state, got %+v", got)
+		}
+		if e := m.setMachineType("L4", true); e != nil {
+			t.Fatalf("expected machine type to unlock after reconcile: %v", e)
+		}
+	})
+
+	t.Run("recovers_runtime_if_operation_allocated", func(t *testing.T) {
+		m := wakeFixture(t, func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "assign") {
+				return wakeResponse(`{"endpoint":"recovered-vm","variant":1,"accelerator":"A100"}`), nil
+			}
+			return nil, fmt.Errorf("unexpected request %s", r.URL.Path)
+		})
+		m.record = ServiceRecord{
+			ID:          "owned",
+			Account:     "test@example.com",
+			Binding:     accountBinding("test@example.com"),
+			Accelerator: "A100",
+			Operation:   "stuck-op",
+			PostSent:    true,
+			State:       "uncertain",
+		}
+		m.studio.svc = m
+		m.studio.svcOnce.Do(func() {})
+		if e := m.studio.RefreshService(); e != nil {
+			t.Fatal(e)
+		}
+		got := m.get()
+		if got.Runtime == "" || got.Operation != "" || got.PostSent || got.State != "allocated" {
+			t.Fatalf("expected RefreshService to adopt recovered runtime, got %+v", got)
+		}
+	})
+
+	t.Run("runtimes_empty_list_clears_uncertain_operation", func(t *testing.T) {
+		m := wakeFixture(t, func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "assignments") {
+				return wakeResponse(`{"assignments":[]}`), nil
+			}
+			return nil, fmt.Errorf("unexpected request %s", r.URL.Path)
+		})
+		m.record = ServiceRecord{
+			ID:          "owned",
+			Account:     "test@example.com",
+			Binding:     accountBinding("test@example.com"),
+			Accelerator: "L4",
+			Operation:   "stuck-op",
+			PostSent:    true,
+			State:       "uncertain",
+		}
+		m.studio.compatible = true
+		m.studio.svc = m
+		m.studio.svcOnce.Do(func() {})
+		rows, e := m.studio.Runtimes()
+		if e != nil || len(rows) != 0 {
+			t.Fatalf("unexpected Runtimes result: rows=%v err=%v", rows, e)
+		}
+		got := m.get()
+		if got.Operation != "" || got.PostSent || got.State != "stopped" {
+			t.Fatalf("expected Runtimes() empty check to unlock uncertain state, got %+v", got)
+		}
+	})
+}

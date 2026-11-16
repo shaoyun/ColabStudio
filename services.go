@@ -355,21 +355,23 @@ func (m *serviceManager) wake(scheduled bool) error {
 		return m.fail(r, e)
 	}
 	if r.Operation != "" {
-		a, e := assignChallenge(httpClient, tunnelBase, token, r.Operation, accelerator)
-		if e != nil {
-			return m.fail(r, e)
+		if !r.PostSent {
+			clearPendingOperation(&r, "")
+			if e = m.put(r); e != nil {
+				return e
+			}
+		} else {
+			a, e := assignChallenge(httpClient, tunnelBase, token, r.Operation, accelerator)
+			if e != nil {
+				return m.fail(r, e)
+			}
+			if !endpointPattern.MatchString(a.Endpoint) {
+				r.State = "uncertain"
+				return m.fail(r, errors.New("上次申请结果尚未确认，已阻止再次创建；请先核对实例列表"))
+			}
+			adoptAllocatedRuntime(&r, a.assignment, "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费")
+			return m.put(r)
 		}
-		if a.Endpoint == "" {
-			r.State = "uncertain"
-			return m.fail(r, errors.New("上次申请结果尚未确认，已阻止再次创建；请先核对实例列表"))
-		}
-		r.Runtime = mapAssignment(a.assignment).Name
-		r.State = "allocated"
-		if e = m.put(r); e != nil {
-			return e
-		}
-		r.Message = "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费"
-		return m.put(r)
 	}
 	if e = m.guardDuplicate(token, r); e != nil {
 		return m.fail(r, e)
@@ -392,16 +394,17 @@ func (m *serviceManager) wake(scheduled bool) error {
 	}
 	a, e := assignChallenge(httpClient, tunnelBase, token, r.Operation, accelerator)
 	if e != nil {
+		clearPendingOperation(&r, "")
 		return m.fail(r, e)
 	}
 	if a.Endpoint == "" {
 		if a.Token == "" {
+			clearPendingOperation(&r, "")
 			return m.fail(r, errors.New("申请确认令牌缺失，未创建实例"))
 		}
 		if scheduled {
 			if _, active, _ := ruleWindow(r.Rule, time.Now()); !active {
-				r.Operation = ""
-				r.State = "stopped"
+				clearPendingOperation(&r, "")
 				return m.fail(r, errors.New("运行时段已结束，未发送创建请求"))
 			}
 		}
@@ -411,22 +414,112 @@ func (m *serviceManager) wake(scheduled bool) error {
 		}
 		e = tunnelRequest(httpClient, tunnelBase, token, "POST", assignPath(r.Operation, accelerator), a.Token, &a)
 		if e != nil {
-			r.State = "uncertain"
-			return m.fail(r, errors.New("申请返回中断，实例可能已计费；请核对状态，程序不会重复创建"))
+			if !strings.Contains(e.Error(), "HTTP ") {
+				r.State = "uncertain"
+				return m.fail(r, errors.New("申请返回中断，实例可能已计费；请核对状态，程序不会重复创建"))
+			}
+			return m.finishRejectedAssign(token, r, accelerator, e)
 		}
 	}
 	if !endpointPattern.MatchString(a.Endpoint) {
-		r.State = "uncertain"
-		return m.fail(r, errors.New("申请未返回有效实例，已停止自动重试"))
+		return m.finishRejectedAssign(token, r, accelerator, nil)
 	}
-	r.Runtime = mapAssignment(a.assignment).Name
+	adoptAllocatedRuntime(&r, a.assignment, "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费")
+	return m.put(r)
+}
+
+func clearPendingOperation(r *ServiceRecord, message string) {
+	r.Operation = ""
+	r.PostSent = false
+	r.State = "stopped"
+	r.StartupError = ""
+	r.StartupPhase = ""
+	r.Message = message
+}
+
+func adoptAllocatedRuntime(r *ServiceRecord, a assignment, message string) {
+	r.Runtime = mapAssignment(a).Name
+	r.Operation = ""
+	r.PostSent = false
 	r.State = "allocated"
-	r.Message = "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费"
-	if e = m.put(r); e != nil {
+	r.StartupError = ""
+	r.StartupPhase = ""
+	r.Message = message
+}
+
+func reconcilePendingOperation(token string, r *ServiceRecord, accelerator string) (string, error) {
+	ca, ce := assignChallenge(httpClient, tunnelBase, token, r.Operation, accelerator)
+	if ce == nil && endpointPattern.MatchString(ca.Endpoint) {
+		adoptAllocatedRuntime(r, ca.assignment, "")
+		return "recovered", nil
+	}
+	var v struct {
+		Assignments *[]assignment `json:"assignments"`
+	}
+	if ae := tunnelRequest(httpClient, tunnelBase, token, "GET", "assignments?authuser=0", "", &v); ae != nil {
+		return "error", ae
+	}
+	if v.Assignments == nil {
+		return "error", errors.New("实例列表未返回明确结果，暂不解除申请锁定")
+	}
+	if len(*v.Assignments) == 0 {
+		return "empty", nil
+	}
+	if ce == nil && ca.Endpoint == "" {
+		return "unconfirmed_empty_nbh", nil
+	}
+	return "has_other", nil
+}
+
+func (m *serviceManager) finishRejectedAssign(token string, r ServiceRecord, accelerator string, postErr error) error {
+	outcome, _ := reconcilePendingOperation(token, &r, accelerator)
+	explicitClientReject := postErr == nil || strings.Contains(postErr.Error(), "HTTP 4")
+	if outcome == "recovered" {
+		r.Message = "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费"
+		return m.put(r)
+	}
+	if outcome == "empty" || (outcome == "unconfirmed_empty_nbh" && explicitClientReject) {
+		detail := "可能算力池繁忙或配额不足"
+		if postErr != nil {
+			detail = postErr.Error()
+		}
+		clearPendingOperation(&r, "")
+		return m.fail(r, errors.New("Google Colab 当前未能分配 "+accelerator+" 实例（"+detail+"），未产生计费；可稍后重试或切换其他机型"))
+	}
+	r.State = "uncertain"
+	if postErr != nil {
+		return m.fail(r, postErr)
+	}
+	return m.fail(r, errors.New("申请未返回有效实例，已停止自动重试"))
+}
+
+func (m *serviceManager) reconcileUncertain(r *ServiceRecord) error {
+	if r.Runtime != "" || r.Operation == "" {
+		return nil
+	}
+	if !r.PostSent {
+		clearPendingOperation(r, "上次申请尚未提交到云端，已自动解除锁定")
+		return nil
+	}
+	token, e := access()
+	if e != nil {
 		return e
 	}
-	r.Message = "机器已唤醒，尚未部署；请连接 Drive 后部署并启动，或释放机器停止计费"
-	return m.put(r)
+	acc, _ := machineType(r.Accelerator)
+	outcome, re := reconcilePendingOperation(token, r, acc)
+	switch outcome {
+	case "recovered":
+		r.Message = "已找回云端分配的机器，可继续部署或释放"
+		return nil
+	case "empty":
+		clearPendingOperation(r, "已核对云端实例列表：上次申请未产生实例，已解除锁定，可重新选择机型或启动")
+		return nil
+	case "unconfirmed_empty_nbh", "has_other":
+		r.Message = "云端仍有运行中实例，尚未匹配到上次申请；请前往“实例总览”核对"
+		return nil
+	default:
+		return re
+	}
 }
 
 type assignResponse struct {

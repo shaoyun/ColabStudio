@@ -349,19 +349,45 @@ func (s *Studio) call(method, path string, body, out any) error {
 }
 func (s *Studio) Runtimes() ([]Runtime, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var rows []Runtime
+	var e error
 	if s.compatible {
-		return s.compatibleList()
+		rows, e = s.compatibleList()
+	} else {
+		var token string
+		if token, e = access(); e == nil {
+			var compatible bool
+			rows, compatible, e = fetchRuntimes(httpClient, apiBase, tunnelBase, token)
+			if e == nil {
+				s.compatible = compatible
+			}
+		}
 	}
-	token, e := access()
-	if e != nil {
-		return nil, e
-	}
-	rows, compatible, e := fetchRuntimes(httpClient, apiBase, tunnelBase, token)
-	if e == nil {
-		s.compatible = compatible
+	s.mu.Unlock()
+	if e == nil && len(rows) == 0 {
+		s.reconcileEmptyRuntimes()
 	}
 	return rows, e
+}
+
+func (s *Studio) reconcileEmptyRuntimes() {
+	if s.svc == nil || s.svc.err != nil {
+		return
+	}
+	m := s.svc
+	if !m.op.TryLock() {
+		return
+	}
+	defer m.op.Unlock()
+	r := m.get()
+	if r.Runtime != "" || r.Operation == "" {
+		return
+	}
+	if _, e := m.identity(r); e != nil {
+		return
+	}
+	clearPendingOperation(&r, "已核对云端实例列表：当前无运行中实例，已解除申请锁定")
+	_ = m.put(r)
 }
 func (s *Studio) Specs() ([]Eligible, error) {
 	s.mu.Lock()

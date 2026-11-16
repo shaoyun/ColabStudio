@@ -194,6 +194,14 @@ func (m *serviceManager) tick(now, previous time.Time) {
 		}
 		return
 	}
+	if r.Operation != "" {
+		if e := m.reconcileUncertain(&r); e != nil {
+			_ = m.fail(r, e)
+		} else {
+			_ = m.put(r)
+		}
+		return
+	}
 	if active && key != r.LastWindow && key != r.Suppressed {
 		r.LastWindow = key
 		if now.Sub(previous) > 90*time.Second {
@@ -312,7 +320,16 @@ func (s *Studio) RefreshService() error {
 	defer m.op.Unlock()
 	r := m.get()
 	if r.Runtime == "" {
-		return nil
+		if r.Operation == "" {
+			return nil
+		}
+		if _, e := m.identity(r); e != nil {
+			return m.fail(r, e)
+		}
+		if e := m.reconcileUncertain(&r); e != nil {
+			return m.fail(r, e)
+		}
+		return m.put(r)
 	}
 	if _, e := m.identity(r); e != nil {
 		return m.fail(r, e)
